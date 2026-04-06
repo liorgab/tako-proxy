@@ -358,7 +358,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[birth_date]', toTakoDate(birth_date));
         formData.append('employee[enter_date]', toTakoDate(enter_date));
         const validOccupations = ['בניה', 'סיעוד', 'חקלאות', 'אחר'];
-        const safeOccupation = validOccupations.includes(occupation) ? occupation : 'אחר';
+        const safeOccupation = validOccupations.includes(occupation) ? occupation : 'בניה';
         formData.append('employee[occupation]', safeOccupation);
         const safeGender = (gender === 'נקבה') ? 'נקבה' : 'זכר';
         formData.append('employee[gender]', safeGender);
