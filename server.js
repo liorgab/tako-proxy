@@ -604,4 +604,174 @@ app.post('/tako/proxy', auth, async (req, res) => {
     }
 });
 
+// ── /tako/search-employee — חיפוש עובד בטאקו לפי דרכון ─────────────────
+app.post('/tako/search-employee', auth, async (req, res) => {
+    const { email, password, passport } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email + password required' });
+    if (!passport) return res.status(400).json({ error: 'passport required' });
+
+    const BASE = 'https://tako-ins.com';
+    const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+    try {
+        // ── שלב 1: התחברות ─────────────────────────────────────────────
+        const LOGIN_URL = `${BASE}/users/sign_in`;
+        const g = await fetch(LOGIN_URL, {
+            method: 'GET', redirect: 'follow',
+            headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' },
+        });
+        const loginHtml = await g.text();
+        const gCookies = parseCookies(g.headers.get('set-cookie'));
+
+        let loginCsrf = '';
+        for (const re of [
+            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
+            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
+            /name="authenticity_token"\s+value="([^"]+)"/i,
+        ]) {
+            const m = loginHtml.match(re);
+            if (m) { loginCsrf = m[1]; break; }
+        }
+
+        const loginBody = new URLSearchParams();
+        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
+        loginBody.append('user[email]', email);
+        loginBody.append('user[password]', password);
+        loginBody.append('user[remember_me]', '0');
+        loginBody.append('commit', 'כניסה');
+
+        const loginRes = await fetch(LOGIN_URL, {
+            method: 'POST', redirect: 'manual',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': cookieString(gCookies),
+                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
+            },
+            body: loginBody.toString(),
+        });
+
+        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
+        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
+        const loginLocation = loginRes.headers.get('location') || '';
+
+        if (!(loginRes.status === 302 || loginLocation.includes('employer') || loginLocation.includes('home'))) {
+            return res.json({ success: false, error: 'Login failed' });
+        }
+
+        // Follow login redirect
+        if (loginLocation) {
+            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
+            const followRes = await fetch(redirectUrl, {
+                method: 'GET', redirect: 'follow',
+                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA },
+            });
+            await followRes.text();
+            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
+            if (followCookies.length > 0) {
+                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
+                sessionCookieArr.length = 0;
+                updatedArr.forEach(c => sessionCookieArr.push(c));
+            }
+        }
+
+        // ── שלב 2: חיפוש עובד בדף wizard ──────────────────────────────
+        // הדף new_employee_wizard_2 עם passport מחזיר את פרטי העובד אם קיים
+        const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
+        const wizardRes = await fetch(wizardUrl, {
+            method: 'GET', redirect: 'follow',
+            headers: {
+                'Cookie': cookieString(sessionCookieArr),
+                'User-Agent': UA, 'Accept': 'text/html,*/*',
+                'Referer': `${BASE}/front/employer/new_employee_wizard_1`,
+            },
+        });
+
+        const wizardHtml = await wizardRes.text();
+
+        // חיפוש קישור לדף העובד בתוך ה-HTML
+        let takoEmployeeId = '';
+        let takoEmployeeUrl = '';
+        let employeeData = {};
+
+        // חיפוש ID בקישורים (employee?id=XXXXX)
+        const idMatches = wizardHtml.matchAll(/employee\?id=(\d+)/gi);
+        for (const m of idMatches) {
+            takoEmployeeId = m[1];
+        }
+
+        // חיפוש בshowEmployeeDetails URL
+        const showMatch = wizardHtml.match(/showEmployeeDetails\((\d+)\)/);
+        if (showMatch) takoEmployeeId = showMatch[1];
+
+        // חיפוש data-id attributes
+        const dataIdMatch = wizardHtml.match(/data-id=["'](\d+)["']/);
+        if (dataIdMatch) takoEmployeeId = dataIdMatch[1];
+
+        // חיפוש ב-hidden field
+        const hiddenIdMatch = wizardHtml.match(/employee_id.*?value=["'](\d+)["']/i);
+        if (hiddenIdMatch) takoEmployeeId = hiddenIdMatch[1];
+
+        // חילוץ שם העובד מהטופס
+        const firstNameMatch = wizardHtml.match(/employee\[first_name\].*?value=["']([^"']+)["']/i);
+        const lastNameMatch = wizardHtml.match(/employee\[last_name\].*?value=["']([^"']+)["']/i);
+        if (firstNameMatch) employeeData.first_name = firstNameMatch[1];
+        if (lastNameMatch) employeeData.last_name = lastNameMatch[1];
+
+        // חיפוש מספר פוליסה
+        const policyMatch = wizardHtml.match(/policy_number.*?["'](\d+)["']/i);
+        if (policyMatch) employeeData.policy_number = policyMatch[1];
+
+        if (takoEmployeeId) {
+            takoEmployeeUrl = `${BASE}/front/employer/employee?id=${takoEmployeeId}`;
+
+            // ── שלב 3: גישה לדף העובד לחילוץ פרטים נוספים ──────────
+            try {
+                const empPageRes = await fetch(takoEmployeeUrl, {
+                    method: 'GET', redirect: 'follow',
+                    headers: {
+                        'Cookie': cookieString(sessionCookieArr),
+                        'User-Agent': UA, 'Accept': 'text/html,*/*',
+                    },
+                });
+                const empPageHtml = await empPageRes.text();
+
+                // חיפוש מספר פוליסה
+                const policyNumMatch = empPageHtml.match(/מספר פוליסה[^<]*<[^>]*>[\s]*([0-9]+)/);
+                if (policyNumMatch) employeeData.policy_number = policyNumMatch[1];
+
+                // חיפוש חברת ביטוח
+                const insurerMatch = empPageHtml.match(/(מנורה|איילון|הראל|הכשרה)/);
+                if (insurerMatch) employeeData.insurer = insurerMatch[1];
+
+                // חיפוש סטטוס
+                const statusMatch = empPageHtml.match(/(פעילה|מבוטלת|בתהליך)/);
+                if (statusMatch) employeeData.policy_status = statusMatch[1];
+
+                // חיפוש תאריכים
+                const dateMatches = empPageHtml.matchAll(/(\d{2}\/\d{2}\/\d{4})/g);
+                const dates = [];
+                for (const dm of dateMatches) dates.push(dm[1]);
+                if (dates.length >= 2) {
+                    employeeData.start_date = dates[0];
+                    employeeData.end_date = dates[1];
+                }
+            } catch (e) {
+                // Don't fail if employee page can't be read
+            }
+        }
+
+        return res.json({
+            success: !!takoEmployeeId,
+            passport,
+            tako_employee_id: takoEmployeeId,
+            tako_employee_url: takoEmployeeUrl,
+            employee_data: employeeData,
+            wizard_url: wizardRes.url,
+        });
+
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message, stack: e.stack });
+    }
+});
+
 app.listen(PORT, () => console.log(`✅ Tako Proxy v2 on :${PORT}`));
