@@ -675,7 +675,6 @@ app.post('/tako/search-employee', auth, async (req, res) => {
         }
 
         // ── שלב 2: חיפוש עובד בדף wizard ──────────────────────────────
-        // הדף new_employee_wizard_2 עם passport מחזיר את פרטי העובד אם קיים
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
         const wizardRes = await fetch(wizardUrl, {
             method: 'GET', redirect: 'follow',
@@ -688,34 +687,54 @@ app.post('/tako/search-employee', auth, async (req, res) => {
 
         const wizardHtml = await wizardRes.text();
 
-        // חיפוש קישור לדף העובד בתוך ה-HTML
+        // חיפוש מזהה העובד בתוך ה-HTML
         let takoEmployeeId = '';
         let takoEmployeeUrl = '';
         let employeeData = {};
 
-        // חיפוש ID בקישורים (employee?id=XXXXX)
-        const idMatches = wizardHtml.matchAll(/employee\?id=(\d+)/gi);
-        for (const m of idMatches) {
-            takoEmployeeId = m[1];
+        // Pattern 1 (PRIMARY): form id="edit_employee_107778" class="edit_employee"
+        const editFormMatch = wizardHtml.match(/id=["']edit_employee_(\d+)["']/i);
+        if (editFormMatch) takoEmployeeId = editFormMatch[1];
+
+        // Pattern 2: class="edit_employee" with nearby ID
+        if (!takoEmployeeId) {
+            const classMatch = wizardHtml.match(/class=["'][^"']*edit_employee[^"']*["'][^>]*id=["'](\d+)["']/i);
+            if (classMatch) takoEmployeeId = classMatch[1];
         }
 
-        // חיפוש בshowEmployeeDetails URL
-        const showMatch = wizardHtml.match(/showEmployeeDetails\((\d+)\)/);
-        if (showMatch) takoEmployeeId = showMatch[1];
+        // Pattern 3: employee?id=XXXXX links
+        if (!takoEmployeeId) {
+            const idMatches = wizardHtml.matchAll(/employee\?id=(\d+)/gi);
+            for (const m of idMatches) takoEmployeeId = m[1];
+        }
 
-        // חיפוש data-id attributes
-        const dataIdMatch = wizardHtml.match(/data-id=["'](\d+)["']/);
-        if (dataIdMatch) takoEmployeeId = dataIdMatch[1];
+        // Pattern 4: data-id attributes
+        if (!takoEmployeeId) {
+            const dataIdMatch = wizardHtml.match(/data-id=["'](\d+)["']/);
+            if (dataIdMatch) takoEmployeeId = dataIdMatch[1];
+        }
 
-        // חיפוש ב-hidden field
-        const hiddenIdMatch = wizardHtml.match(/employee_id.*?value=["'](\d+)["']/i);
-        if (hiddenIdMatch) takoEmployeeId = hiddenIdMatch[1];
+        // Pattern 5: hidden field with employee_id
+        if (!takoEmployeeId) {
+            const hiddenIdMatch = wizardHtml.match(/employee_id.*?value=["'](\d+)["']/i);
+            if (hiddenIdMatch) takoEmployeeId = hiddenIdMatch[1];
+        }
+
+        // Pattern 6: showEmployeeDetails(ID)
+        if (!takoEmployeeId) {
+            const showMatch = wizardHtml.match(/showEmployeeDetails\((\d+)\)/);
+            if (showMatch) takoEmployeeId = showMatch[1];
+        }
+
+        // זיהוי אם העובד קיים (edit) או חדש (new)
+        const isExistingEmployee = wizardHtml.includes('edit_employee');
 
         // חילוץ שם העובד מהטופס
         const firstNameMatch = wizardHtml.match(/employee\[first_name\].*?value=["']([^"']+)["']/i);
         const lastNameMatch = wizardHtml.match(/employee\[last_name\].*?value=["']([^"']+)["']/i);
         if (firstNameMatch) employeeData.first_name = firstNameMatch[1];
         if (lastNameMatch) employeeData.last_name = lastNameMatch[1];
+        employeeData.is_existing = isExistingEmployee;
 
         // חיפוש מספר פוליסה
         const policyMatch = wizardHtml.match(/policy_number.*?["'](\d+)["']/i);
