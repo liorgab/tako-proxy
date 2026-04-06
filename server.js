@@ -217,12 +217,16 @@ app.post('/tako/create-employee', auth, async (req, res) => {
     const BASE = 'https://tako-ins.com';
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 
-    // המרת תאריך מ-YYYY-MM-DD ל-DD/MM/YYYY (פורמט ישראלי שטאקו מצפה לו)
+    // התאריך נשלח כמו שהוא (YYYY-MM-DD) - זה הפורמט שדפדפנים שולחים מ-input type="date"
+    // אם date_format=il נשלח בפורמט DD/MM/YYYY
+    const dateFormat = req.body.date_format || 'iso'; // 'iso' = YYYY-MM-DD, 'il' = DD/MM/YYYY
     function toTakoDate(isoDate) {
         if (!isoDate) return '';
-        const parts = isoDate.split('-');
-        if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
-        return isoDate; // already in another format, send as-is
+        if (dateFormat === 'il') {
+            const parts = isoDate.split('-');
+            if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+        }
+        return isoDate; // send as-is (YYYY-MM-DD)
     }
 
     try {
@@ -410,29 +414,54 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             });
         }
 
-        // Check for errors in response HTML
-        const errorMatch = submitBody.match(/class="alert[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+        // ── חילוץ שגיאה מתוך ה-HTML המלא ──────────────────────────────
+        // Rails alert box
+        const alertMatch = submitBody.match(/class="alert[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+        // Rails exception page - search the FULL body, not truncated
+        const exceptionMsgMatch = submitBody.match(/class="message"[^>]*>([\s\S]*?)<\/div>/);
+        const h1Match = submitBody.match(/<header[^>]*>[\s\S]*?<h1[^>]*>([\s\S]*?)<\/h1>/);
+        const preMatch = submitBody.match(/<pre[^>]*class="box"[^>]*>([\s\S]*?)<\/pre>/);
+        // Validation errors
         const validationErrors = [];
         const errMatches = submitBody.matchAll(/class="field_with_errors"[\s\S]*?<label[^>]*>(.*?)<\/label>/gi);
         for (const m of errMatches) {
             validationErrors.push(m[1]);
         }
 
-        // Try to extract the Rails exception message
-        const exceptionMatch = submitBody.match(/<pre[^>]*>([\s\S]*?)<\/pre>/);
-        const titleMatch = submitBody.match(/<h1[^>]*>([\s\S]*?)<\/h1>/);
+        // Build the most useful error message possible
+        let railsError = '';
+        if (alertMatch) {
+            railsError = alertMatch[1].replace(/<[^>]+>/g, '').trim();
+        } else if (exceptionMsgMatch) {
+            railsError = exceptionMsgMatch[1].replace(/<[^>]+>/g, '').trim().slice(0, 500);
+        } else if (h1Match) {
+            const h1Text = h1Match[1].replace(/<[^>]+>/g, '').trim();
+            const preText = preMatch ? preMatch[1].replace(/<[^>]+>/g, '').trim().slice(0, 300) : '';
+            railsError = preText ? `${h1Text}: ${preText}` : h1Text;
+        }
+
+        // Fallback: strip ALL html tags from body and grab first meaningful text
+        if (!railsError) {
+            const stripped = submitBody
+                .replace(/<style[\s\S]*?<\/style>/gi, '')
+                .replace(/<script[\s\S]*?<\/script>/gi, '')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            // Find first chunk of text that isn't just numbers/whitespace
+            const meaningful = stripped.match(/[a-zA-Zא-ת]{3,}[\s\S]{10,200}/);
+            railsError = meaningful ? meaningful[0].trim().slice(0, 300) : 'Unknown error (could not parse Rails response)';
+        }
 
         return res.json({
             success: false,
             step: 'submit',
             status: submitStatus,
             redirect: submitLocation,
-            error: errorMatch ? errorMatch[1].replace(/<[^>]+>/g, '').trim()
-                 : exceptionMatch ? exceptionMatch[1].replace(/<[^>]+>/g, '').trim().slice(0, 500)
-                 : titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim()
-                 : 'Unknown error',
+            error: railsError,
             validation_errors: validationErrors,
-            html_preview: submitBody.slice(0, 3000),
+            body_length: submitBody.length,
+            date_format_used: dateFormat,
             sent_data: {
                 birth_date: toTakoDate(birth_date),
                 enter_date: toTakoDate(enter_date),
