@@ -754,25 +754,48 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 });
                 const empPageHtml = await empPageRes.text();
 
-                // חיפוש מספר פוליסה
-                const policyNumMatch = empPageHtml.match(/מספר פוליסה[^<]*<[^>]*>[\s]*([0-9]+)/);
-                if (policyNumMatch) employeeData.policy_number = policyNumMatch[1];
+                // ── חילוץ נתונים מטבלת פוליסות ──
+                // טבלת הפוליסות: סטטוס | מספר פוליסה | שם העובד | מספר העובד | חברת ביטוח | מס. קופת חולים | תאריך התחלה | תאריך סיום
+                // בHTML הסטטוס מופיע כ: <span class="label label-xxx">סטטוס</span>
+                // התאריכים בפורמט YYYY-MM-DD
+
+                // חיפוש סטטוס מתוך span.label (כולל כל הסטטוסים האפשריים)
+                const statusLabelMatch = empPageHtml.match(/<span[^>]*class=["'][^"']*label[^"']*["'][^>]*>\s*(פעילה|פתיחה|מבוטלת|בתהליך|ממתינה|הוקפאה|לא פעילה|בבירור)\s*<\/span>/i);
+                if (statusLabelMatch) employeeData.policy_status = statusLabelMatch[1].trim();
 
                 // חיפוש חברת ביטוח
-                const insurerMatch = empPageHtml.match(/(מנורה|איילון|הראל|הכשרה)/);
+                const insurerMatch = empPageHtml.match(/(מנורה|איילון|הראל|הכשרה|כלל|מגדל|ביטוח ישיר|פניקס|הפניקס)/);
                 if (insurerMatch) employeeData.insurer = insurerMatch[1];
 
-                // חיפוש סטטוס
-                const statusMatch = empPageHtml.match(/(פעילה|מבוטלת|בתהליך)/);
-                if (statusMatch) employeeData.policy_status = statusMatch[1];
+                // חיפוש תאריכים - פורמט YYYY-MM-DD (כמו 2026-04-06)
+                const dateMatchesISO = empPageHtml.matchAll(/(\d{4}-\d{2}-\d{2})/g);
+                const datesISO = [];
+                for (const dm of dateMatchesISO) datesISO.push(dm[1]);
+                if (datesISO.length >= 2) {
+                    employeeData.start_date = datesISO[0];
+                    employeeData.end_date = datesISO[1];
+                } else if (datesISO.length === 1) {
+                    employeeData.start_date = datesISO[0];
+                }
 
-                // חיפוש תאריכים
-                const dateMatches = empPageHtml.matchAll(/(\d{2}\/\d{2}\/\d{4})/g);
-                const dates = [];
-                for (const dm of dateMatches) dates.push(dm[1]);
-                if (dates.length >= 2) {
-                    employeeData.start_date = dates[0];
-                    employeeData.end_date = dates[1];
+                // גם לנסות פורמט DD/MM/YYYY אם ISO לא נמצא
+                if (!employeeData.start_date) {
+                    const dateMatchesEU = empPageHtml.matchAll(/(\d{2}\/\d{2}\/\d{4})/g);
+                    const datesEU = [];
+                    for (const dm of dateMatchesEU) datesEU.push(dm[1]);
+                    if (datesEU.length >= 2) {
+                        employeeData.start_date = datesEU[0];
+                        employeeData.end_date = datesEU[1];
+                    }
+                }
+
+                // חיפוש מספר פוליסה - מספר בתוך טבלת פוליסות (לא תמיד קיים)
+                const policyNumMatch = empPageHtml.match(/מספר פוליסה[^<]*<[^>]*>[\s]*([0-9]+)/);
+                if (policyNumMatch) employeeData.policy_number = policyNumMatch[1];
+                // גם לנסות למצוא מספר פוליסה מתוך טבלת שאלונים רפואיים
+                if (!employeeData.policy_number) {
+                    const medicalPolicyMatch = empPageHtml.match(/מספר פוליסה[\s\S]*?<td>\s*(\d{4,})\s*<\/td>/i);
+                    if (medicalPolicyMatch) employeeData.policy_number = medicalPolicyMatch[1];
                 }
             } catch (e) {
                 // Don't fail if employee page can't be read
