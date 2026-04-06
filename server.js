@@ -439,13 +439,56 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         const submitLocation = submitRes.headers.get('location') || '';
         const submitBody = await submitRes.text();
 
-        // Redirect 302 = success
+        // Redirect 302 = success — follow redirect to get Tako employee ID
         if (submitStatus === 302 || submitStatus === 301) {
+            let takoEmployeeId = '';
+            let takoEmployeeUrl = '';
+
+            // Try to extract employee ID from redirect URL
+            const idMatch = submitLocation.match(/[?&]id=(\d+)/);
+            if (idMatch) {
+                takoEmployeeId = idMatch[1];
+            }
+
+            // Follow the redirect to find the employee page
+            if (submitLocation) {
+                try {
+                    const redirectUrl = submitLocation.startsWith('http')
+                        ? submitLocation
+                        : `${BASE}${submitLocation}`;
+                    const followRes = await fetch(redirectUrl, {
+                        method: 'GET', redirect: 'follow',
+                        headers: {
+                            'Cookie': finalCookies,
+                            'User-Agent': UA,
+                            'Accept': 'text/html,*/*',
+                        },
+                    });
+                    const followBody = await followRes.text();
+                    // Try to find employee ID from the final page URL or content
+                    const finalUrl = followRes.url || '';
+                    const urlIdMatch = finalUrl.match(/[?&]id=(\d+)/);
+                    if (urlIdMatch) takoEmployeeId = urlIdMatch[1];
+                    // Also search the page content for the employee link
+                    if (!takoEmployeeId) {
+                        const contentIdMatch = followBody.match(/employee\?id=(\d+)/);
+                        if (contentIdMatch) takoEmployeeId = contentIdMatch[1];
+                    }
+                    if (takoEmployeeId) {
+                        takoEmployeeUrl = `${BASE}/front/employer/employee?id=${takoEmployeeId}`;
+                    }
+                } catch (e) {
+                    // Don't fail the whole request if redirect follow fails
+                }
+            }
+
             return res.json({
                 success: true,
                 step: 'submit',
                 status: submitStatus,
                 redirect: submitLocation,
+                tako_employee_id: takoEmployeeId,
+                tako_employee_url: takoEmployeeUrl,
                 message: 'Employee registered successfully in Tako',
                 sent_data: {
                     birth_date: toTakoDate(birth_date),
