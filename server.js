@@ -357,8 +357,11 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[country]', country || '');
         formData.append('employee[birth_date]', toTakoDate(birth_date));
         formData.append('employee[enter_date]', toTakoDate(enter_date));
-        formData.append('employee[occupation]', occupation || 'אחר');
-        formData.append('employee[gender]', gender || 'זכר');
+        const validOccupations = ['בניה', 'סיעוד', 'חקלאות', 'אחר'];
+        const safeOccupation = validOccupations.includes(occupation) ? occupation : 'אחר';
+        formData.append('employee[occupation]', safeOccupation);
+        const safeGender = (gender === 'נקבה') ? 'נקבה' : 'זכר';
+        formData.append('employee[gender]', safeGender);
         formData.append('employee[street]', street || '');
         formData.append('employee[house_no]', house_no || '');
         formData.append('employee[city]', city || '');
@@ -397,6 +400,13 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 status: submitStatus,
                 redirect: submitLocation,
                 message: 'Employee registered successfully in Tako',
+                sent_data: {
+                    birth_date: toTakoDate(birth_date),
+                    from_date: toTakoDate(from_date),
+                    to_date: toTakoDate(to_date),
+                    country, occupation: safeOccupation, gender: safeGender,
+                    insurance_company, passport, first_name, last_name,
+                },
             });
         }
 
@@ -428,8 +438,8 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 enter_date: toTakoDate(enter_date),
                 from_date: toTakoDate(from_date),
                 to_date: toTakoDate(to_date),
-                country, occupation, gender, insurance_company,
-                passport, first_name, last_name,
+                country, occupation: safeOccupation, gender: safeGender,
+                insurance_company, passport, first_name, last_name,
             },
         });
 
