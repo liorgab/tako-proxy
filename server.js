@@ -19,6 +19,36 @@ function auth(req, res, next) {
     next();
 }
 
+// ── Cookie helpers ─────────────────────────────────────────────────────────
+// Parse set-cookie header into array of "name=value" strings
+function parseCookies(setCookieHeader) {
+    if (!setCookieHeader) return [];
+    return setCookieHeader
+        .split(/,(?=[^;]+=[^;]+)/)
+        .map(c => c.split(';')[0].trim())
+        .filter(c => c.includes('='));
+}
+
+// Merge cookies: later values override earlier ones by cookie NAME
+// This prevents sending duplicate _session_id which breaks Rails CSRF
+function mergeCookies(...cookieArrays) {
+    const map = new Map();
+    for (const arr of cookieArrays) {
+        for (const cookie of arr) {
+            const eqIdx = cookie.indexOf('=');
+            if (eqIdx > 0) {
+                const name = cookie.substring(0, eqIdx);
+                map.set(name, cookie);
+            }
+        }
+    }
+    return Array.from(map.values());
+}
+
+function cookieString(cookieArray) {
+    return cookieArray.join('; ');
+}
+
 app.get('/health', (_, res) =>
     res.json({ ok: true, ts: new Date().toISOString() })
 );
@@ -245,11 +275,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         });
         const loginHtml = await g.text();
 
-        const setCookie = g.headers.get('set-cookie') || '';
-        const gCookies = setCookie
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map(c => c.split(';')[0].trim())
-            .filter(c => c.includes('='));
+        const gCookies = parseCookies(g.headers.get('set-cookie'));
 
         // CSRF for login
         let loginCsrf = '';
@@ -274,7 +300,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             method: 'POST', redirect: 'manual',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': gCookies.join('; '),
+                'Cookie': cookieString(gCookies),
                 'User-Agent': UA,
                 'Referer': LOGIN_URL,
                 'Origin': BASE,
@@ -283,12 +309,10 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             body: loginBody.toString(),
         });
 
-        const loginPostCookies = (loginRes.headers.get('set-cookie') || '')
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map(c => c.split(';')[0].trim())
-            .filter(c => c.includes('='));
+        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
 
-        const sessionCookies = [...new Set([...gCookies, ...loginPostCookies])].join('; ');
+        // Merge: login POST cookies override GET cookies (newer _session_id wins)
+        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
         const loginLocation = loginRes.headers.get('location') || '';
 
         const loginSuccess = loginRes.status === 302
@@ -308,10 +332,31 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         // ── שלב 2: גישה לטופס רישום עובד (לקבלת CSRF token) ──────────────
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
 
+        // Follow the login redirect first to establish session properly
+        if (loginLocation) {
+            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
+            const followRes = await fetch(redirectUrl, {
+                method: 'GET', redirect: 'follow',
+                headers: {
+                    'Cookie': cookieString(sessionCookieArr),
+                    'User-Agent': UA,
+                    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                },
+            });
+            await followRes.text(); // consume body
+            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
+            if (followCookies.length > 0) {
+                // Update session cookies with any new ones from the redirect
+                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
+                sessionCookieArr.length = 0;
+                updatedArr.forEach(c => sessionCookieArr.push(c));
+            }
+        }
+
         const wizardRes = await fetch(wizardUrl, {
             method: 'GET', redirect: 'follow',
             headers: {
-                'Cookie': sessionCookies,
+                'Cookie': cookieString(sessionCookieArr),
                 'User-Agent': UA,
                 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
                 'Referer': `${BASE}/front/employer/new_employee_wizard_1`,
@@ -319,8 +364,12 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         });
 
         const wizardHtml = await wizardRes.text();
+        const wizardCookiesNew = parseCookies(wizardRes.headers.get('set-cookie'));
 
-        // CSRF token from the form
+        // Merge wizard cookies - wizard's session takes priority
+        const afterWizardCookies = mergeCookies(sessionCookieArr, wizardCookiesNew);
+
+        // CSRF token from the form - try form hidden field first, then meta tag
         let formCsrf = '';
         for (const re of [
             /name="authenticity_token"\s+value="([^"]+)"/i,
@@ -338,19 +387,13 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 step: 'wizard',
                 error: 'Could not find CSRF token in wizard form',
                 wizard_status: wizardRes.status,
+                wizard_url: wizardRes.url,
                 html_preview: wizardHtml.slice(0, 500),
             });
         }
 
-        // Update cookies from wizard response
-        const wizardCookies = (wizardRes.headers.get('set-cookie') || '')
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map(c => c.split(';')[0].trim())
-            .filter(c => c.includes('='));
-
-        const finalCookies = wizardCookies.length > 0
-            ? [...new Set([...sessionCookies.split('; '), ...wizardCookies])].join('; ')
-            : sessionCookies;
+        // Use properly merged cookies for form submission
+        const finalCookies = cookieString(afterWizardCookies);
 
         // ── שלב 3: שליחת טופס רישום העובד ─────────────────────────────────
         const formData = new URLSearchParams();
