@@ -797,14 +797,15 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                     }
                 }
 
-                // חיפוש מספר פוליסה מתוך טבלת שאלונים רפואיים (מופיע מחוץ לסקשן הפוליסות)
-                const medicalSection = empPageHtml.indexOf('שאלונים רפואיים');
-                if (medicalSection > -1) {
-                    const medicalHtml = empPageHtml.substring(medicalSection);
-                    const policyNumMatch = medicalHtml.match(/<td>\s*(\d{4,})\s*<\/td>/);
-                    if (policyNumMatch) employeeData.policy_number = policyNumMatch[1];
-                }
-            } catch (e) {
+                // חיפוש מספר פוליסה + policy_eid מתוך טבלת פוליסות לעובד
+                // המבנה: <td><a href="/front/employer/employment?eid=265523">5297002616250</a></td>
+                if (policiesSection) {
+                    const policyLinkMatch = policiesSection.match(/<a\s+href="\/front\/employer\/employment\?eid=(\d+)">\s*(\d+)\s*<\/a>/);
+                    if (policyLinkMatch) {
+                        employeeData.policy_eid = policyLinkMatch[1];
+                        employeeData.policy_number = policyLinkMatch[2];
+                    }
+                }            } catch (e) {
                 // Don't fail if employee page can't be read
             }
         }
