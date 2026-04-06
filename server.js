@@ -217,6 +217,14 @@ app.post('/tako/create-employee', auth, async (req, res) => {
     const BASE = 'https://tako-ins.com';
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 
+    // המרת תאריך מ-YYYY-MM-DD ל-DD/MM/YYYY (פורמט ישראלי שטאקו מצפה לו)
+    function toTakoDate(isoDate) {
+        if (!isoDate) return '';
+        const parts = isoDate.split('-');
+        if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+        return isoDate; // already in another format, send as-is
+    }
+
     try {
         // ── שלב 1: התחברות לטאקו ────────────────────────────────────────────
         const LOGIN_URL = `${BASE}/users/sign_in`;
@@ -347,8 +355,8 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[last_name]', last_name || '');
         formData.append('employee[passport]', passport || '');
         formData.append('employee[country]', country || '');
-        formData.append('employee[birth_date]', birth_date || '');
-        formData.append('employee[enter_date]', enter_date || '');
+        formData.append('employee[birth_date]', toTakoDate(birth_date));
+        formData.append('employee[enter_date]', toTakoDate(enter_date));
         formData.append('employee[occupation]', occupation || 'אחר');
         formData.append('employee[gender]', gender || 'זכר');
         formData.append('employee[street]', street || '');
@@ -359,8 +367,8 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[temp_send_sms_str]', send_sms || 'NO');
         formData.append('employee[temp_emp_no]', emp_no || '');
         formData.append('employee[temp_dept]', dept || '');
-        formData.append('employee[tmp_from_date]', from_date || '');
-        formData.append('employee[tmp_to_date]', to_date || '');
+        formData.append('employee[tmp_from_date]', toTakoDate(from_date));
+        formData.append('employee[tmp_to_date]', toTakoDate(to_date));
         formData.append('employee[tmp_insurance_company]', insurance_company || '');
         formData.append('commit', 'שמור');
 
@@ -400,14 +408,29 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             validationErrors.push(m[1]);
         }
 
+        // Try to extract the Rails exception message
+        const exceptionMatch = submitBody.match(/<pre[^>]*>([\s\S]*?)<\/pre>/);
+        const titleMatch = submitBody.match(/<h1[^>]*>([\s\S]*?)<\/h1>/);
+
         return res.json({
             success: false,
             step: 'submit',
             status: submitStatus,
             redirect: submitLocation,
-            error: errorMatch ? errorMatch[1].replace(/<[^>]+>/g, '').trim() : 'Unknown error',
+            error: errorMatch ? errorMatch[1].replace(/<[^>]+>/g, '').trim()
+                 : exceptionMatch ? exceptionMatch[1].replace(/<[^>]+>/g, '').trim().slice(0, 500)
+                 : titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').trim()
+                 : 'Unknown error',
             validation_errors: validationErrors,
-            html_preview: submitBody.slice(0, 1500),
+            html_preview: submitBody.slice(0, 3000),
+            sent_data: {
+                birth_date: toTakoDate(birth_date),
+                enter_date: toTakoDate(enter_date),
+                from_date: toTakoDate(from_date),
+                to_date: toTakoDate(to_date),
+                country, occupation, gender, insurance_company,
+                passport, first_name, last_name,
+            },
         });
 
     } catch (e) {
