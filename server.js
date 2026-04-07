@@ -694,7 +694,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 // ══════════════════════════════════════════════════════════
                 // ── חילוץ נתוני שאלונים רפואיים ─────────────────────────
                 // ══════════════════════════════════════════════════════════
-                const medicalStart = empPageHtml.indexOf('שאלונים רפואיים');
+                const medicalStart = empPageHtml.lastIndexOf('שאלונים רפואיים');
                 if (medicalStart > -1) {
                     // מחפשים את הטבלה הבאה אחרי הכותרת
                     const medicalSection = empPageHtml.substring(medicalStart, medicalStart + 5000);
