@@ -793,4 +793,311 @@ app.post('/tako/search-employee', auth, async (req, res) => {
         return res.status(500).json({ success: false, error: e.message, stack: e.stack });
     }
 });
+// ── /tako/get-card — הורדת כרטיס קופת חולים מטאקו ───────────────────────
+app.post('/tako/get-card', auth, async (req, res) => {
+    const { email, password, tako_employee_id, policy_eid } = req.body || {};
+    if (!email || !password) return res.status(400).json({ success: false, error: 'email + password required' });
+    if (!tako_employee_id) return res.status(400).json({ success: false, error: 'tako_employee_id required' });
+
+    const BASE = 'https://tako-ins.com';
+    const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+
+    try {
+        // ── שלב 1: התחברות ─────────────────────────────────────────────
+        const LOGIN_URL = `${BASE}/users/sign_in`;
+        const g = await fetch(LOGIN_URL, {
+            method: 'GET', redirect: 'follow',
+            headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' },
+        });
+        const loginHtml = await g.text();
+        const gCookies = parseCookies(g.headers.get('set-cookie'));
+
+        let loginCsrf = '';
+        for (const re of [
+            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
+            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
+            /name="authenticity_token"\s+value="([^"]+)"/i,
+        ]) {
+            const m = loginHtml.match(re);
+            if (m) { loginCsrf = m[1]; break; }
+        }
+
+        const loginBody = new URLSearchParams();
+        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
+        loginBody.append('user[email]', email);
+        loginBody.append('user[password]', password);
+        loginBody.append('user[remember_me]', '0');
+        loginBody.append('commit', 'כניסה');
+
+        const loginRes = await fetch(LOGIN_URL, {
+            method: 'POST', redirect: 'manual',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': cookieString(gCookies),
+                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
+            },
+            body: loginBody.toString(),
+        });
+
+        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
+        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
+        const loginLocation = loginRes.headers.get('location') || '';
+
+        if (!(loginRes.status === 302 || loginLocation.includes('employer') || loginLocation.includes('home'))) {
+            return res.json({ success: false, error: 'Login failed' });
+        }
+
+        // Follow login redirect
+        if (loginLocation) {
+            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
+            const followRes = await fetch(redirectUrl, {
+                method: 'GET', redirect: 'follow',
+                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA },
+            });
+            await followRes.text();
+            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
+            if (followCookies.length > 0) {
+                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
+                sessionCookieArr.length = 0;
+                updatedArr.forEach(c => sessionCookieArr.push(c));
+            }
+        }
+
+        // ── שלב 2: גישה לדף העובד ──────────────────────────────────────
+        const empUrl = `${BASE}/front/employer/employee?id=${tako_employee_id}`;
+        const empRes = await fetch(empUrl, {
+            method: 'GET', redirect: 'follow',
+            headers: {
+                'Cookie': cookieString(sessionCookieArr),
+                'User-Agent': UA, 'Accept': 'text/html,*/*',
+            },
+        });
+        const empHtml = await empRes.text();
+
+        // ── שלב 3: חיפוש קישור כרטיס בדף העובד ────────────────────────
+        // דפוסים אפשריים לקישור כרטיס:
+        // 1. /front/employer/employment_card?eid=XXX
+        // 2. /front/employer/get_card?eid=XXX
+        // 3. /front/employer/print_card?eid=XXX
+        // 4. כל קישור עם "card" או "כרטיס" או "tofes" בנתיב
+        // 5. קישור ישיר לתמונה/PDF
+        let cardUrl = '';
+
+        // ── ניסיון 1: חיפוש קישורים ספציפיים לכרטיס בדף ──
+        const cardPatterns = [
+            // קישור ישיר עם eid
+            /href=["'](\/front\/employer\/employment_card\?eid=\d+)["']/i,
+            /href=["'](\/front\/employer\/get_card\?eid=\d+)["']/i,
+            /href=["'](\/front\/employer\/print_card\?eid=\d+)["']/i,
+            /href=["'](\/front\/employer\/card\?eid=\d+)["']/i,
+            // כל URL עם "card" + eid
+            /href=["']([^"']*card[^"']*eid=\d+[^"']*)["']/i,
+            /href=["']([^"']*eid=\d+[^"']*card[^"']*)["']/i,
+            // כרטיס בעברית
+            /href=["']([^"']+)["'][^>]*>.*?כרטיס/i,
+            // קישור עם tofes (טופס)
+            /href=["'](\/front\/employer\/tofes[^"']*)["']/i,
+        ];
+
+        for (const pattern of cardPatterns) {
+            const m = empHtml.match(pattern);
+            if (m) {
+                cardUrl = m[1].startsWith('http') ? m[1] : `${BASE}${m[1]}`;
+                break;
+            }
+        }
+
+        // ── ניסיון 2: אם יש policy_eid, ננסה URLs ישירים ──
+        if (!cardUrl && policy_eid) {
+            const directUrls = [
+                `${BASE}/front/employer/employment_card?eid=${policy_eid}`,
+                `${BASE}/front/employer/get_card?eid=${policy_eid}`,
+                `${BASE}/front/employer/print_card?eid=${policy_eid}`,
+            ];
+
+            for (const tryUrl of directUrls) {
+                try {
+                    const tryRes = await fetch(tryUrl, {
+                        method: 'GET', redirect: 'follow',
+                        headers: {
+                            'Cookie': cookieString(sessionCookieArr),
+                            'User-Agent': UA,
+                            'Accept': 'image/*,application/pdf,*/*',
+                        },
+                    });
+                    const ct = tryRes.headers.get('content-type') || '';
+                    if (ct.includes('image') || ct.includes('pdf') || ct.includes('octet-stream')) {
+                        // מצאנו כרטיס!
+                        const arrayBuffer = await tryRes.arrayBuffer();
+                        const buffer = Buffer.from(arrayBuffer);
+                        const base64 = buffer.toString('base64');
+                        const contentType = ct.includes('pdf') ? 'application/pdf'
+                            : ct.includes('png') ? 'image/png'
+                            : ct.includes('jpeg') || ct.includes('jpg') ? 'image/jpeg'
+                            : 'image/png';
+                        return res.json({
+                            success: true,
+                            image_base64: base64,
+                            content_type: contentType,
+                            source_url: tryUrl,
+                        });
+                    }
+                    // אם HTML, ננסה למצוא קישור לכרטיס בתוכו
+                    const tryHtml = await tryRes.text();
+                    const imgMatch = tryHtml.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
+                    if (imgMatch && (imgMatch[1].includes('card') || imgMatch[1].includes('tofes'))) {
+                        cardUrl = imgMatch[1].startsWith('http') ? imgMatch[1] : `${BASE}${imgMatch[1]}`;
+                        break;
+                    }
+                } catch (e) {
+                    // ממשיכים לנסות
+                }
+            }
+        }
+
+        // ── ניסיון 3: חיפוש employment page עם eid ──
+        if (!cardUrl && policy_eid) {
+            const eidUrl = `${BASE}/front/employer/employment?eid=${policy_eid}`;
+            try {
+                const eidRes = await fetch(eidUrl, {
+                    method: 'GET', redirect: 'follow',
+                    headers: {
+                        'Cookie': cookieString(sessionCookieArr),
+                        'User-Agent': UA, 'Accept': 'text/html,*/*',
+                    },
+                });
+                const eidHtml = await eidRes.text();
+
+                // חיפוש קישורים לכרטיס בדף הפוליסה
+                const eidCardPatterns = [
+                    /href=["']([^"']*card[^"']*)["']/i,
+                    /href=["']([^"']*כרטיס[^"']*)["']/i,
+                    /href=["']([^"']*tofes[^"']*)["']/i,
+                    /href=["']([^"']*print[^"']*)["']/i,
+                    /href=["']([^"']*download[^"']*)["']/i,
+                ];
+
+                for (const pattern of eidCardPatterns) {
+                    const m = eidHtml.match(pattern);
+                    if (m) {
+                        cardUrl = m[1].startsWith('http') ? m[1] : `${BASE}${m[1]}`;
+                        break;
+                    }
+                }
+
+                // אם לא מצאנו כלום, מחזירים debug info
+                if (!cardUrl) {
+                    // חיפוש כל הקישורים בדף
+                    const allLinks = [];
+                    const linkRegex = /href=["']([^"']+)["']/gi;
+                    let linkMatch;
+                    while ((linkMatch = linkRegex.exec(eidHtml)) !== null) {
+                        allLinks.push(linkMatch[1]);
+                    }
+                    return res.json({
+                        success: false,
+                        error: 'Card link not found on employment page',
+                        debug: {
+                            employment_url: eidUrl,
+                            page_title: (eidHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
+                            page_length: eidHtml.length,
+                            all_links: allLinks.filter(l => !l.startsWith('#') && !l.startsWith('javascript')).slice(0, 30),
+                        },
+                    });
+                }
+            } catch (e) {
+                // ממשיכים
+            }
+        }
+
+        // ── שלב 4: הורדת הכרטיס ────────────────────────────────────────
+        if (cardUrl) {
+            const cardRes = await fetch(cardUrl, {
+                method: 'GET', redirect: 'follow',
+                headers: {
+                    'Cookie': cookieString(sessionCookieArr),
+                    'User-Agent': UA,
+                    'Accept': 'image/*,application/pdf,*/*',
+                },
+            });
+            const ct = cardRes.headers.get('content-type') || '';
+
+            if (ct.includes('image') || ct.includes('pdf') || ct.includes('octet-stream')) {
+                const arrayBuffer = await cardRes.arrayBuffer();
+                const buffer = Buffer.from(arrayBuffer);
+                const base64 = buffer.toString('base64');
+                const contentType = ct.includes('pdf') ? 'application/pdf'
+                    : ct.includes('png') ? 'image/png'
+                    : ct.includes('jpeg') || ct.includes('jpg') ? 'image/jpeg'
+                    : 'image/png';
+                return res.json({
+                    success: true,
+                    image_base64: base64,
+                    content_type: contentType,
+                    source_url: cardUrl,
+                });
+            }
+
+            // אם קיבלנו HTML — ננסה למצוא תמונה בתוכו
+            const cardHtml = await cardRes.text();
+            const imgMatch = cardHtml.match(/<img[^>]+src=["']([^"']+)["']/i);
+            if (imgMatch) {
+                const imgUrl = imgMatch[1].startsWith('http') ? imgMatch[1] : `${BASE}${imgMatch[1]}`;
+                const imgRes = await fetch(imgUrl, {
+                    method: 'GET', redirect: 'follow',
+                    headers: {
+                        'Cookie': cookieString(sessionCookieArr),
+                        'User-Agent': UA,
+                        'Accept': 'image/*,*/*',
+                    },
+                });
+                const imgCt = imgRes.headers.get('content-type') || '';
+                if (imgCt.includes('image')) {
+                    const arrayBuffer = await imgRes.arrayBuffer();
+                    const buffer = Buffer.from(arrayBuffer);
+                    const base64 = buffer.toString('base64');
+                    return res.json({
+                        success: true,
+                        image_base64: base64,
+                        content_type: imgCt,
+                        source_url: imgUrl,
+                    });
+                }
+            }
+
+            return res.json({
+                success: false,
+                error: 'Card URL found but returned unexpected content',
+                debug: {
+                    card_url: cardUrl,
+                    content_type: ct,
+                    html_preview: (typeof cardHtml === 'string' ? cardHtml : '').slice(0, 500),
+                },
+            });
+        }
+
+        // ── לא מצאנו כרטיס — מחזירים debug ─────────────────────────────
+        // חיפוש כל הקישורים בדף העובד
+        const allLinks = [];
+        const linkRegex = /href=["']([^"']+)["']/gi;
+        let lm;
+        while ((lm = linkRegex.exec(empHtml)) !== null) {
+            allLinks.push(lm[1]);
+        }
+
+        return res.json({
+            success: false,
+            error: 'Card link not found on employee page',
+            debug: {
+                employee_url: empUrl,
+                page_title: (empHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
+                page_length: empHtml.length,
+                all_links: allLinks.filter(l => !l.startsWith('#') && !l.startsWith('javascript')).slice(0, 30),
+            },
+        });
+
+    } catch (e) {
+        return res.status(500).json({ success: false, error: e.message, stack: e.stack });
+    }
+});
 app.listen(PORT, () => console.log(`✅ Tako Proxy v2 on :${PORT}`));
