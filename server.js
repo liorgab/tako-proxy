@@ -1,5 +1,5 @@
 /**
- * Tako Insurance Proxy Server v2 — with full debug
+ * Tako Insurance Proxy Server v2 â with full debug
  */
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -14,7 +14,7 @@ function auth(req, res, next) {
     if (key !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
     next();
 }
-// ── Cookie helpers ─────────────────────────────────────────────────────────
+// ââ Cookie helpers âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 // Parse set-cookie header into array of "name=value" strings
 function parseCookies(setCookieHeader) {
     if (!setCookieHeader) return [];
@@ -44,11 +44,11 @@ function cookieString(cookieArray) {
 app.get('/health', (_, res) =>
     res.json({ ok: true, ts: new Date().toISOString() })
 );
-// ── /tako/debug — בדיקת גישה בסיסית לטאקו ─────────────────────────────────
+// ââ /tako/debug â ××××§×ª ×××©× ××¡××¡××ª ××××§× âââââââââââââââââââââââââââââââââ
 app.get('/tako/debug', auth, async (req, res) => {
     const URL = 'https://tako-ins.com/users/sign_in';
     const results = {};
-    // ניסיון 1: redirect follow
+    // × ××¡××× 1: redirect follow
     try {
         const r = await fetch(URL, {
             method: 'GET',
@@ -71,7 +71,7 @@ app.get('/tako/debug', auth, async (req, res) => {
             body_preview: text.slice(0, 500),
         };
     } catch (e) { results.attempt1_follow = { error: e.message }; }
-    // ניסיון 2: redirect manual
+    // × ××¡××× 2: redirect manual
     try {
         const r = await fetch(URL, {
             method: 'GET',
@@ -90,7 +90,7 @@ app.get('/tako/debug', auth, async (req, res) => {
             body_preview: text.slice(0, 500),
         };
     } catch (e) { results.attempt2_manual = { error: e.message }; }
-    // ניסיון 3: HTTP (לא HTTPS)
+    // × ××¡××× 3: HTTP (×× HTTPS)
     try {
         const r = await fetch('http://tako-ins.com/users/sign_in', {
             method: 'GET',
@@ -104,7 +104,7 @@ app.get('/tako/debug', auth, async (req, res) => {
     } catch (e) { results.attempt3_http = { error: e.message }; }
     return res.json(results);
 });
-// ── /tako/login ─────────────────────────────────────────────────────────────
+// ââ /tako/login âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 app.post('/tako/login', auth, async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password)
@@ -113,7 +113,7 @@ app.post('/tako/login', auth, async (req, res) => {
     const LOGIN_URL = `${BASE}/users/sign_in`;
     const UA        = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     try {
-        // ── Step 1: GET ──────────────────────────────────────────────────────
+        // ââ Step 1: GET ââââââââââââââââââââââââââââââââââââââââââââââââââââââ
         const g = await fetch(LOGIN_URL, {
             method: 'GET',
             redirect: 'follow',
@@ -148,13 +148,13 @@ app.post('/tako/login', auth, async (req, res) => {
             const m = html.match(re);
             if (m) { csrf = m[1]; break; }
         }
-        // ── Step 2: POST ─────────────────────────────────────────────────────
+        // ââ Step 2: POST âââââââââââââââââââââââââââââââââââââââââââââââââââââ
         const body = new URLSearchParams();
         if (csrf) body.append('authenticity_token', csrf);
         body.append('user[email]',       email);
         body.append('user[password]',    password);
         body.append('user[remember_me]', '0');
-        body.append('commit',            'כניסה');
+        body.append('commit',            '×× ××¡×');
         const p = await fetch(LOGIN_URL, {
             method: 'POST',
             redirect: 'manual',
@@ -200,7 +200,7 @@ app.post('/tako/login', auth, async (req, res) => {
         return res.status(500).json({ error: e.message, stack: e.stack });
     }
 });
-// ── /tako/create-employee — רישום עובד חדש + פתיחת פוליסה בטאקו ──────────
+// ââ /tako/create-employee â ×¨××©×× ×¢××× ×××© + ×¤×ª×××ª ×¤××××¡× ××××§× ââââââââââ
 app.post('/tako/create-employee', auth, async (req, res) => {
     const {
         email, password,
@@ -210,7 +210,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         phone_no, send_sms, emp_no, dept,
         from_date, to_date, insurance_company
     } = req.body || {};
-    // ולידציה בסיסית
+    // ×××××¦×× ××¡××¡××ª
     if (!email || !password)
         return res.status(400).json({ error: 'email + password required' });
     if (!first_name || !last_name || !passport)
@@ -229,7 +229,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         return isoDate;
     }
     try {
-        // ── שלב 1: התחברות לטאקו ────────────────────────────────────────────
+        // ââ ×©×× 1: ××ª×××¨××ª ××××§× ââââââââââââââââââââââââââââââââââââââââââââ
         const LOGIN_URL = `${BASE}/users/sign_in`;
         const g = await fetch(LOGIN_URL, {
             method: 'GET', redirect: 'follow',
@@ -258,7 +258,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         loginBody.append('user[email]', email);
         loginBody.append('user[password]', password);
         loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
+        loginBody.append('commit', '×× ××¡×');
         const loginRes = await fetch(LOGIN_URL, {
             method: 'POST', redirect: 'manual',
             headers: {
@@ -281,7 +281,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 status: loginRes.status, location: loginLocation,
             });
         }
-        // ── שלב 2: גישה לטופס רישום עובד ──────────────────────────────────
+        // ââ ×©×× 2: ×××©× ××××¤×¡ ×¨××©×× ×¢××× ââââââââââââââââââââââââââââââââââ
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
         if (loginLocation) {
             const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
@@ -325,7 +325,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             });
         }
         const finalCookies = cookieString(afterWizardCookies);
-        // ── שלב 3: שליחת טופס רישום העובד ─────────────────────────────────
+        // ââ ×©×× 3: ×©××××ª ×××¤×¡ ×¨××©×× ××¢××× âââââââââââââââââââââââââââââââââ
         const formData = new URLSearchParams();
         formData.append('authenticity_token', formCsrf);
         formData.append('employee[first_name]', first_name || '');
@@ -334,10 +334,10 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[country]', country || '');
         formData.append('employee[birth_date]', toTakoDate(birth_date));
         formData.append('employee[enter_date]', toTakoDate(enter_date));
-        const validOccupations = ['בניה', 'סיעוד', 'חקלאות', 'אחר'];
-        const safeOccupation = validOccupations.includes(occupation) ? occupation : 'בניה';
+        const validOccupations = ['×× ××', '×¡××¢××', '××§××××ª', '×××¨'];
+        const safeOccupation = validOccupations.includes(occupation) ? occupation : '×× ××';
         formData.append('employee[occupation]', safeOccupation);
-        const safeGender = (gender === 'נקבה') ? 'נקבה' : 'זכר';
+        const safeGender = (gender === '× ×§××') ? '× ×§××' : '×××¨';
         formData.append('employee[gender]', safeGender);
         formData.append('employee[street]', street || '');
         formData.append('employee[house_no]', house_no || '');
@@ -350,7 +350,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[tmp_from_date]', toTakoDate(from_date));
         formData.append('employee[tmp_to_date]', toTakoDate(to_date));
         formData.append('employee[tmp_insurance_company]', insurance_company || '');
-        formData.append('commit', 'שמור');
+        formData.append('commit', '×©×××¨');
         const submitRes = await fetch(`${BASE}/front/employer/save_new_employee`, {
             method: 'POST', redirect: 'manual',
             headers: {
@@ -399,7 +399,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 },
             });
         }
-        // ── חילוץ שגיאה ──────────────────────────────────────────────────
+        // ââ ×××××¥ ×©×××× ââââââââââââââââââââââââââââââââââââââââââââââââââ
         const alertMatch = submitBody.match(/class="alert[^"]*"[^>]*>([\s\S]*?)<\/div>/);
         const exceptionMsgMatch = submitBody.match(/class="message"[^>]*>([\s\S]*?)<\/div>/);
         const h1Match = submitBody.match(/<header[^>]*>[\s\S]*?<h1[^>]*>([\s\S]*?)<\/h1>/);
@@ -422,7 +422,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
                 .replace(/<style[\s\S]*?<\/style>/gi, '')
                 .replace(/<script[\s\S]*?<\/script>/gi, '')
                 .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-            const meaningful = stripped.match(/[a-zA-Zא-ת]{3,}[\s\S]{10,200}/);
+            const meaningful = stripped.match(/[a-zA-Z×-×ª]{3,}[\s\S]{10,200}/);
             railsError = meaningful ? meaningful[0].trim().slice(0, 300) : 'Unknown error (could not parse Rails response)';
         }
         return res.json({
@@ -441,7 +441,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         return res.status(500).json({ success: false, step: 'exception', error: e.message, stack: e.stack });
     }
 });
-// ── /tako/proxy ─────────────────────────────────────────────────────────────
+// ââ /tako/proxy âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 app.post('/tako/proxy', auth, async (req, res) => {
     const { url, method = 'GET', body, session_cookies, headers: xh = {} } = req.body || {};
     if (!url) return res.status(400).json({ error: 'url required' });
@@ -468,7 +468,7 @@ app.post('/tako/proxy', auth, async (req, res) => {
         return res.status(500).json({ error: e.message });
     }
 });
-// ── /tako/search-employee — חיפוש עובד בטאקו לפי דרכון ─────────────────
+// ââ /tako/search-employee â ×××¤××© ×¢××× ××××§× ××¤× ××¨××× âââââââââââââââââ
 app.post('/tako/search-employee', auth, async (req, res) => {
     const { email, password, passport } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email + password required' });
@@ -476,7 +476,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
     const BASE = 'https://tako-ins.com';
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     try {
-        // ── שלב 1: התחברות ─────────────────────────────────────────────
+        // ââ ×©×× 1: ××ª×××¨××ª âââââââââââââââââââââââââââââââââââââââââââââ
         const LOGIN_URL = `${BASE}/users/sign_in`;
         const g = await fetch(LOGIN_URL, {
             method: 'GET', redirect: 'follow',
@@ -498,7 +498,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
         loginBody.append('user[email]', email);
         loginBody.append('user[password]', password);
         loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
+        loginBody.append('commit', '×× ××¡×');
         const loginRes = await fetch(LOGIN_URL, {
             method: 'POST', redirect: 'manual',
             headers: {
@@ -529,7 +529,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 updatedArr.forEach(c => sessionCookieArr.push(c));
             }
         }
-        // ── שלב 2: חיפוש עובד בדף wizard ──────────────────────────────
+        // ââ ×©×× 2: ×××¤××© ×¢××× ×××£ wizard ââââââââââââââââââââââââââââââ
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
         const wizardRes = await fetch(wizardUrl, {
             method: 'GET', redirect: 'follow',
@@ -581,7 +581,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
         if (policyMatch) employeeData.policy_number = policyMatch[1];
         if (takoEmployeeId) {
             takoEmployeeUrl = `${BASE}/front/employer/employee?id=${takoEmployeeId}`;
-            // ── שלב 3: גישה לדף העובד לחילוץ פרטים נוספים ──────────
+            // ââ ×©×× 3: ×××©× ×××£ ××¢××× ××××××¥ ×¤×¨××× × ××¡×¤×× ââââââââââ
             try {
                 const empPageRes = await fetch(takoEmployeeUrl, {
                     method: 'GET', redirect: 'follow',
@@ -592,41 +592,45 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 });
                 const empPageHtml = await empPageRes.text();
 
-                // ══════════════════════════════════════════════════════════
-                // ── חילוץ נתונים מטבלת פוליסות (v3 — מפרסר כל השורות) ──
-                // ══════════════════════════════════════════════════════════
-                // מפרסר את כל שורות הטבלה ובוחר את הפוליסה הנכונה
-                // עדיפות: פעילה > בקשת חידוש > פתיחה > מבוטלת
-                const policiesStart = empPageHtml.indexOf('פוליסות לעובד');
-                const policiesEnd = empPageHtml.indexOf('שאלונים רפואיים', policiesStart > -1 ? policiesStart : 0);
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+                // ââ ×××××¥ × ×ª×× ×× ×××××ª ×¤××××¡××ª (v3 â ××¤×¨×¡×¨ ×× ××©××¨××ª) ââ
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+                // ××¤×¨×¡×¨ ××ª ×× ×©××¨××ª ××××× ×××××¨ ××ª ××¤××××¡× ×× ××× ×
+                // ×¢×××¤××ª: ×¤×¢××× > ××§×©×ª ×××××© > ×¤×ª××× > ××××××ª
+                const policiesStart = empPageHtml.indexOf('×¤××××¡××ª ××¢×××');
+                const policiesEnd = empPageHtml.indexOf('×©×××× ×× ×¨×¤×××××', policiesStart > -1 ? policiesStart : 0);
                 const policiesSection = policiesStart > -1
                     ? empPageHtml.substring(policiesStart, policiesEnd > policiesStart ? policiesEnd : empPageHtml.length)
                     : '';
 
                 if (policiesSection) {
-                    // פרסור כל שורות הטבלה
+                    // ×¤×¨×¡××¨ ×× ×©××¨××ª ×××××
                     const rows = policiesSection.match(/<tr[\s\S]*?<\/tr>/gi) || [];
                     const policies = [];
 
                     for (const row of rows) {
                         const policy = {};
 
-                        // סטטוס מתוך span.label
-                        const statusMatch = row.match(/<span[^>]*class=["'][^"']*label[^"']*["'][^>]*>\s*(פעילה|פתיחה|מבוטלת|בתהליך|ממתינה|הוקפאה|לא פעילה|בבירור|בקשת חידוש|בקשת ביטול)\s*<\/span>/i);
+                        // ×¡××××¡ ××ª×× span.label
+                        const statusMatch = row.match(/<span[^>]*class=["'][^"']*label[^"']*["'][^>]*>\s*(×¤×¢×××|×¤×ª×××|××××××ª|××ª××××|×××ª×× ×|×××§×¤××|×× ×¤×¢×××|××××¨××¨|××§×©×ª ×××××©|××§×©×ª ×××××)\s*<\/span>/i);
                         if (statusMatch) policy.status = statusMatch[1].trim();
 
-                        // קישור פוליסה (eid + מספר פוליסה)
+                        // ×§××©××¨ ×¤××××¡× (eid + ××¡×¤×¨ ×¤××××¡×)
                         const linkMatch = row.match(/<a\s+href="\/front\/employer\/employment\?eid=(\d+)">\s*(\d+)\s*<\/a>/);
                         if (linkMatch) {
                             policy.eid = linkMatch[1];
                             policy.number = linkMatch[2];
                         }
 
-                        // חברת ביטוח
-                        const insurerMatch = row.match(/<td>\s*(מנורה|איילון|הראל|הכשרה|כלל|מגדל|ביטוח ישיר|פניקס|הפניקס)\s*<\/td>/);
+                        // ×××¨×ª ×××××
+                        const insurerMatch = row.match(/<td>\s*(×× ××¨×|××××××|××¨××|×××©×¨×|×××|××××|××××× ××©××¨|×¤× ××§×¡|××¤× ××§×¡)\s*<\/td>/);
                         if (insurerMatch) policy.insurer = insurerMatch[1];
 
-                        // תאריכים - פורמט ISO (YYYY-MM-DD)
+                        // HMO number - unique per employee (7-13 digits in plain td)
+                        const hmoMatch = row.match(/<td>\s*(\d{7,13})\s*<\/td>/);
+                        if (hmoMatch) policy.hmo_number = hmoMatch[1];
+
+                        // ×ª××¨×××× - ×¤××¨×× ISO (YYYY-MM-DD)
                         const dates = [];
                         const dateMatches = row.matchAll(/<td>\s*(\d{4}-\d{2}-\d{2})\s*<\/td>/g);
                         for (const dm of dateMatches) dates.push(dm[1]);
@@ -637,7 +641,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                             policy.start_date = dates[0];
                         }
 
-                        // גם לנסות פורמט DD/MM/YYYY
+                        // ×× ×× ×¡××ª ×¤××¨×× DD/MM/YYYY
                         if (!policy.start_date) {
                             const datesEU = [];
                             const dateMatchesEU = row.matchAll(/<td>\s*(\d{2}\/\d{2}\/\d{4})\s*<\/td>/g);
@@ -648,24 +652,24 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                             }
                         }
 
-                        // רק שורות עם סטטוס או קישור (מדלגים על header)
+                        // ×¨×§ ×©××¨××ª ×¢× ×¡××××¡ ×× ×§××©××¨ (×××××× ×¢× header)
                         if (policy.status || policy.eid) {
                             policies.push(policy);
                         }
                     }
 
-                    // בחירת הפוליסה הנכונה: עדיפות לפי סטטוס, אח"כ תאריך התחלה מאוחר
+                    // ××××¨×ª ××¤××××¡× ×× ××× ×: ×¢×××¤××ª ××¤× ×¡××××¡, ××"× ×ª××¨×× ××ª××× ×××××¨
                     const STATUS_PRIORITY = {
-                        'פעילה': 1,
-                        'בקשת חידוש': 2,
-                        'פתיחה': 3,
-                        'בתהליך': 4,
-                        'ממתינה': 5,
-                        'בקשת ביטול': 6,
-                        'הוקפאה': 7,
-                        'מבוטלת': 8,
-                        'לא פעילה': 9,
-                        'בבירור': 10,
+                        '×¤×¢×××': 1,
+                        '××§×©×ª ×××××©': 2,
+                        '×¤×ª×××': 3,
+                        '××ª××××': 4,
+                        '×××ª×× ×': 5,
+                        '××§×©×ª ×××××': 6,
+                        '×××§×¤××': 7,
+                        '××××××ª': 8,
+                        '×× ×¤×¢×××': 9,
+                        '××××¨××¨': 10,
                     };
 
                     if (policies.length > 0) {
@@ -673,7 +677,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                             const pa = STATUS_PRIORITY[a.status] || 99;
                             const pb = STATUS_PRIORITY[b.status] || 99;
                             if (pa !== pb) return pa - pb;
-                            // אותה עדיפות - תאריך התחלה מאוחר יותר מנצח
+                            // ×××ª× ×¢×××¤××ª - ×ª××¨×× ××ª××× ×××××¨ ×××ª×¨ ×× ×¦×
                             return (b.start_date || '').localeCompare(a.start_date || '');
                         });
 
@@ -682,21 +686,22 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                         if (best.insurer) employeeData.insurer = best.insurer;
                         if (best.eid) employeeData.policy_eid = best.eid;
                         if (best.number) employeeData.policy_number = best.number;
+                        if (best.hmo_number) employeeData.hmo_number = best.hmo_number;
                         if (best.start_date) employeeData.start_date = best.start_date;
                         if (best.end_date) employeeData.end_date = best.end_date;
                     }
 
-                    // שמירת כל הפוליסות למטרות debug
+                    // ×©×××¨×ª ×× ××¤××××¡××ª ××××¨××ª debug
                     employeeData.all_policies = policies;
                 }
-                // ══════════════════════════════════════════════════════════
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
-                // ══════════════════════════════════════════════════════════
-                // ── חילוץ נתוני שאלונים רפואיים ─────────────────────────
-                // ══════════════════════════════════════════════════════════
-                const medicalStart = empPageHtml.lastIndexOf('שאלונים רפואיים');
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+                // ââ ×××××¥ × ×ª×× × ×©×××× ×× ×¨×¤××××× âââââââââââââââââââââââââ
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+                const medicalStart = empPageHtml.lastIndexOf('×©×××× ×× ×¨×¤×××××');
                 if (medicalStart > -1) {
-                    // מחפשים את הטבלה הבאה אחרי הכותרת
+                    // ×××¤×©×× ××ª ××××× ×××× ×××¨× ××××ª×¨×ª
                     const medicalSection = empPageHtml.substring(medicalStart, medicalStart + 5000);
                     const medicalRows = medicalSection.match(/<tr[\s\S]*?<\/tr>/gi) || [];
                     const questionnaires = [];
@@ -704,62 +709,62 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                     for (const row of medicalRows) {
                         const q = {};
 
-                        // סטטוס: מולא / לא מולא
-                        if (row.includes('מולא')) {
-                            q.status = row.includes('לא מולא') ? 'לא מולא' : 'מולא';
+                        // ×¡××××¡: ×××× / ×× ××××
+                        if (row.includes('××××')) {
+                            q.status = row.includes('×× ××××') ? '×× ××××' : '××××';
                         }
 
-                        // Form ID — מתוך לינקים /medical_forms/{id}/preview או /medical_forms/{id}/edit
+                        // Form ID â ××ª×× ××× ×§×× /medical_forms/{id}/preview ×× /medical_forms/{id}/edit
                         const formIdMatch = row.match(/\/medical_forms\/(\d+)\/(preview|edit)/);
                         if (formIdMatch) {
                             q.form_id = formIdMatch[1];
-                            q.form_type = formIdMatch[2]; // preview = ממולא, edit = לא ממולא
+                            q.form_type = formIdMatch[2]; // preview = ×××××, edit = ×× ×××××
                         }
 
-                        // גם מ-checkbox: <input type="checkbox" id="133811" value="133811">
+                        // ×× ×-checkbox: <input type="checkbox" id="133811" value="133811">
                         if (!q.form_id) {
                             const checkboxMatch = row.match(/medical_forms\[\].*?value=["'](\d+)["']/);
                             if (checkboxMatch) q.form_id = checkboxMatch[1];
                         }
 
-                        // גם מ-send_medical_form_link parameter
+                        // ×× ×-send_medical_form_link parameter
                         if (!q.form_id) {
                             const sendLinkMatch = row.match(/send_medical_form_link=(\d+)/);
                             if (sendLinkMatch) q.form_id = sendLinkMatch[1];
                         }
 
-                        // תאריך חתימה
+                        // ×ª××¨×× ××ª×××
                         const dateMatch = row.match(/(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}/);
                         if (dateMatch) q.signed_date = dateMatch[1];
 
-                        // מספר פוליסה
+                        // ××¡×¤×¨ ×¤××××¡×
                         const polNumMatch = row.match(/<td>\s*(\d{4,})\s*<\/td>/);
                         if (polNumMatch) q.policy_number = polNumMatch[1];
 
-                        // רק שורות עם מידע רלוונטי
+                        // ×¨×§ ×©××¨××ª ×¢× ××××¢ ×¨×××× ××
                         if (q.status || q.form_id) {
                             questionnaires.push(q);
                         }
                     }
 
-                    // מיון: "לא מולא" קודם (דורש פעולה), אח"כ לפי תאריך חתימה יורד
+                    // ××××: "×× ××××" ×§××× (×××¨×© ×¤×¢×××), ××"× ××¤× ×ª××¨×× ××ª××× ×××¨×
                     if (questionnaires.length > 0) {
                         questionnaires.sort((a, b) => {
-                            // עדיפות ראשונה: "לא מולא" לפני "מולא"
-                            const aUnfilled = (a.status === 'לא מולא') ? 0 : 1;
-                            const bUnfilled = (b.status === 'לא מולא') ? 0 : 1;
+                            // ×¢×××¤××ª ×¨××©×× ×: "×× ××××" ××¤× × "××××"
+                            const aUnfilled = (a.status === '×× ××××') ? 0 : 1;
+                            const bUnfilled = (b.status === '×× ××××') ? 0 : 1;
                             if (aUnfilled !== bUnfilled) return aUnfilled - bUnfilled;
-                            // עדיפות שנייה: תאריך חתימה יורד
+                            // ×¢×××¤××ª ×©× ×××: ×ª××¨×× ××ª××× ×××¨×
                             return (b.signed_date || '').localeCompare(a.signed_date || '');
                         });
 
-                        // השאלון הרלוונטי ביותר — "לא מולא" אם קיים, אחרת האחרון שמולא
+                        // ××©×××× ××¨×××× ×× ××××ª×¨ â "×× ××××" ×× ×§×××, ×××¨×ª ××××¨×× ×©××××
                         const latest = questionnaires[0];
                         employeeData.medical_form_id = latest.form_id || '';
                         employeeData.medical_form_status = latest.status || '';
                         employeeData.medical_form_signed_date = latest.signed_date || '';
                         if (latest.form_id) {
-                            if (latest.status === 'מולא') {
+                            if (latest.status === '××××') {
                                 employeeData.medical_form_url = `${BASE}/medical_forms/${latest.form_id}/preview`;
                             } else {
                                 employeeData.medical_form_url = `${BASE}/medical_forms/${latest.form_id}/edit`;
@@ -767,10 +772,10 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                         }
                     }
 
-                    // שמירת כל השאלונים למטרות debug
+                    // ×©×××¨×ª ×× ××©×××× ×× ××××¨××ª debug
                     employeeData.all_questionnaires = questionnaires;
                 }
-                // ══════════════════════════════════════════════════════════
+                // ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
             } catch (e) {
                 // Don't fail if employee page can't be read
@@ -788,4 +793,4 @@ app.post('/tako/search-employee', auth, async (req, res) => {
         return res.status(500).json({ success: false, error: e.message, stack: e.stack });
     }
 });
-app.listen(PORT, () => console.log(`✅ Tako Proxy v2 on :${PORT}`));
+app.listen(PORT, () => console.log(`â Tako Proxy v2 on :${PORT}`));
