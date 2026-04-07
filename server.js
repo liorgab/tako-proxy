@@ -795,6 +795,7 @@ app.post('/tako/search-employee', auth, async (req, res) => {
 });
 // ── /tako/get-card — הורדת כרטיס קופת חולים מטאקו ───────────────────────
 // URL pattern: https://tako-ins.com/employees/{tako_employee_id}/card_{hmo}
+// מחזיר את כל ה-HTML של דף הכרטיס עם תמונות inline כ-data URI
 // hmo options: leumit, clalit, maccabi, meuchedet
 app.post('/tako/get-card', auth, async (req, res) => {
     const { email, password, tako_employee_id, policy_eid } = req.body || {};
@@ -866,9 +867,8 @@ app.post('/tako/get-card', auth, async (req, res) => {
         }
 
         // ── שלב 2: ניסיון ישיר — /employees/{id}/card_{hmo} ────────────
-        // ננסה את כל קופות החולים האפשריות
+        // ננסה את כל קופות החולים ונחזיר HTML מלא עם תמונות inline
         const HMO_SLUGS = ['leumit', 'clalit', 'maccabi', 'meuchedet'];
-        let cardFound = false;
 
         for (const hmo of HMO_SLUGS) {
             const cardUrl = `${BASE}/employees/${tako_employee_id}/card_${hmo}`;
@@ -878,140 +878,134 @@ app.post('/tako/get-card', auth, async (req, res) => {
                     headers: {
                         'Cookie': cookieString(sessionCookieArr),
                         'User-Agent': UA,
-                        'Accept': 'image/*,application/pdf,text/html,*/*',
+                        'Accept': 'text/html,image/*,*/*',
                     },
                 });
                 const ct = cardRes.headers.get('content-type') || '';
 
-                // אם קיבלנו תמונה ישירות
-                if (ct.includes('image') || ct.includes('pdf') || ct.includes('octet-stream')) {
+                // אם קיבלנו תמונה ישירות (לא צפוי אבל לטיפול)
+                if (ct.includes('image')) {
                     const arrayBuffer = await cardRes.arrayBuffer();
                     const buffer = Buffer.from(arrayBuffer);
-                    const base64 = buffer.toString('base64');
-                    const contentType = ct.includes('pdf') ? 'application/pdf'
-                        : ct.includes('png') ? 'image/png'
-                        : ct.includes('jpeg') || ct.includes('jpg') ? 'image/jpeg'
-                        : 'image/png';
                     return res.json({
                         success: true,
-                        image_base64: base64,
-                        content_type: contentType,
+                        type: 'image',
+                        image_base64: buffer.toString('base64'),
+                        content_type: ct,
                         source_url: cardUrl,
-                        hmo: hmo,
+                        hmo,
                     });
                 }
 
-                // אם קיבלנו HTML — בודקים אם יש תמונת כרטיס בתוכו
-                const html = await cardRes.text();
+                // קיבלנו HTML — זה המצב הנפוץ
+                let html = await cardRes.text();
 
-                // דלג אם זה redirect ל-login או דף שגיאה
-                if (html.includes('sign_in') || html.includes('404') || html.includes('not found')) {
+                // דלג על דפי login או שגיאה
+                if (html.includes('sign_in') || html.includes('404') || html.length < 200) {
                     continue;
                 }
 
-                // חיפוש תמונת כרטיס בתוך ה-HTML
-                // דפוס 1: img tag עם src
-                const imgPatterns = [
-                    /<img[^>]+src=["']([^"']+)["'][^>]*>/gi,
-                ];
-
-                for (const pattern of imgPatterns) {
-                    let match;
-                    while ((match = pattern.exec(html)) !== null) {
-                        const imgSrc = match[1];
-                        // דלג על תמונות קטנות (לוגו, אייקונים)
-                        if (imgSrc.includes('logo') || imgSrc.includes('icon') || imgSrc.includes('favicon')) continue;
-
-                        const imgUrl = imgSrc.startsWith('http') ? imgSrc : imgSrc.startsWith('//') ? `https:${imgSrc}` : `${BASE}${imgSrc}`;
-                        try {
-                            const imgRes = await fetch(imgUrl, {
-                                method: 'GET', redirect: 'follow',
-                                headers: {
-                                    'Cookie': cookieString(sessionCookieArr),
-                                    'User-Agent': UA,
-                                    'Accept': 'image/*,*/*',
-                                },
-                            });
-                            const imgCt = imgRes.headers.get('content-type') || '';
-                            const imgLength = parseInt(imgRes.headers.get('content-length') || '0', 10);
-
-                            // רק תמונות גדולות מ-5KB (לא אייקונים)
-                            if (imgCt.includes('image') && (imgLength > 5000 || imgLength === 0)) {
-                                const arrayBuffer = await imgRes.arrayBuffer();
-                                const buffer = Buffer.from(arrayBuffer);
-                                // בדיקה נוספת: תמונה מעל 5KB
-                                if (buffer.length > 5000) {
-                                    const base64 = buffer.toString('base64');
-                                    return res.json({
-                                        success: true,
-                                        image_base64: base64,
-                                        content_type: imgCt,
-                                        source_url: imgUrl,
-                                        hmo: hmo,
-                                    });
-                                }
-                            }
-                        } catch (e) {
-                            // ממשיכים
-                        }
-                    }
+                // ── Inline כל התמונות ב-HTML כ-data URI ──
+                const imgRegex = /<img([^>]+)src=["']([^"']+)["']/gi;
+                const imgReplacements = [];
+                let imgMatch;
+                while ((imgMatch = imgRegex.exec(html)) !== null) {
+                    const fullMatch = imgMatch[0];
+                    const imgSrc = imgMatch[2];
+                    const imgUrl = imgSrc.startsWith('http') ? imgSrc
+                        : imgSrc.startsWith('//') ? `https:${imgSrc}`
+                        : `${BASE}${imgSrc}`;
+                    imgReplacements.push({ fullMatch, imgSrc, imgUrl });
                 }
 
-                // אם ה-HTML עצמו נראה כמו דף כרטיס (מכיל תוכן רלוונטי)
-                if (html.length > 500 && !html.includes('sign_in') && (html.includes('card') || html.includes('כרטיס'))) {
-                    cardFound = true;
-                    // מחזירים את ה-HTML כ-debug
-                    return res.json({
-                        success: false,
-                        error: 'Card page found but no image extracted',
-                        debug: {
-                            card_url: cardUrl,
-                            hmo: hmo,
-                            content_type: ct,
-                            html_length: html.length,
-                            html_preview: html.slice(0, 1000),
-                        },
-                    });
+                // CSS background-image URLs
+                const bgRegex = /background(?:-image)?\s*:\s*url\(["']?([^"')]+)["']?\)/gi;
+                const bgReplacements = [];
+                let bgMatch;
+                while ((bgMatch = bgRegex.exec(html)) !== null) {
+                    const fullMatch = bgMatch[0];
+                    const bgSrc = bgMatch[1];
+                    const bgUrl = bgSrc.startsWith('http') ? bgSrc
+                        : bgSrc.startsWith('//') ? `https:${bgSrc}`
+                        : `${BASE}${bgSrc}`;
+                    bgReplacements.push({ fullMatch, bgSrc, bgUrl });
                 }
+
+                // הורדה והמרה של כל התמונות
+                for (const rep of imgReplacements) {
+                    try {
+                        const r = await fetch(rep.imgUrl, {
+                            method: 'GET', redirect: 'follow',
+                            headers: {
+                                'Cookie': cookieString(sessionCookieArr),
+                                'User-Agent': UA,
+                                'Accept': 'image/*,*/*',
+                            },
+                        });
+                        const imgCt = r.headers.get('content-type') || 'image/png';
+                        const buf = Buffer.from(await r.arrayBuffer());
+                        const dataUri = `data:${imgCt};base64,${buf.toString('base64')}`;
+                        html = html.split(rep.imgSrc).join(dataUri);
+                    } catch (e) { /* skip failed images */ }
+                }
+
+                for (const rep of bgReplacements) {
+                    try {
+                        const r = await fetch(rep.bgUrl, {
+                            method: 'GET', redirect: 'follow',
+                            headers: {
+                                'Cookie': cookieString(sessionCookieArr),
+                                'User-Agent': UA,
+                                'Accept': 'image/*,*/*',
+                            },
+                        });
+                        const bgCt = r.headers.get('content-type') || 'image/png';
+                        const buf = Buffer.from(await r.arrayBuffer());
+                        const dataUri = `data:${bgCt};base64,${buf.toString('base64')}`;
+                        html = html.split(rep.bgSrc).join(dataUri);
+                    } catch (e) { /* skip failed bg images */ }
+                }
+
+                // ── Inline CSS חיצוני ──
+                const cssRegex = /<link[^>]+href=["']([^"']+\.css[^"']*)["'][^>]*>/gi;
+                let cssMatch;
+                while ((cssMatch = cssRegex.exec(html)) !== null) {
+                    const cssHref = cssMatch[1];
+                    const cssUrl = cssHref.startsWith('http') ? cssHref
+                        : cssHref.startsWith('//') ? `https:${cssHref}`
+                        : `${BASE}${cssHref}`;
+                    try {
+                        const r = await fetch(cssUrl, {
+                            method: 'GET', redirect: 'follow',
+                            headers: {
+                                'Cookie': cookieString(sessionCookieArr),
+                                'User-Agent': UA,
+                            },
+                        });
+                        const cssText = await r.text();
+                        html = html.replace(cssMatch[0], `<style>${cssText}</style>`);
+                    } catch (e) { /* skip failed CSS */ }
+                }
+
+                return res.json({
+                    success: true,
+                    type: 'html',
+                    card_html: html,
+                    source_url: cardUrl,
+                    hmo,
+                });
+
             } catch (e) {
                 // ממשיכים לקופת חולים הבאה
             }
         }
 
-        // ── שלב 3: fallback — חיפוש בדף העובד ──────────────────────────
-        const empUrl = `${BASE}/front/employer/employee?id=${tako_employee_id}`;
-        const empRes = await fetch(empUrl, {
-            method: 'GET', redirect: 'follow',
-            headers: {
-                'Cookie': cookieString(sessionCookieArr),
-                'User-Agent': UA, 'Accept': 'text/html,*/*',
-            },
-        });
-        const empHtml = await empRes.text();
-
-        // חיפוש קישורי כרטיס בדף העובד
-        const cardLinks = [];
-        const linkRegex = /href=["']([^"']*card[^"']*)["']/gi;
-        let lm;
-        while ((lm = linkRegex.exec(empHtml)) !== null) {
-            cardLinks.push(lm[1]);
-        }
-
-        // חיפוש כל הקישורים
-        const allLinks = [];
-        const allLinkRegex = /href=["']([^"']+)["']/gi;
-        while ((lm = allLinkRegex.exec(empHtml)) !== null) {
-            allLinks.push(lm[1]);
-        }
-
         return res.json({
             success: false,
-            error: cardFound ? 'Card page found but could not extract image' : 'Card not found for any HMO',
+            error: 'Card not found for any HMO',
             debug: {
                 tako_employee_id,
                 tried_urls: HMO_SLUGS.map(h => `${BASE}/employees/${tako_employee_id}/card_${h}`),
-                card_links_on_employee_page: cardLinks,
-                all_links_sample: allLinks.filter(l => !l.startsWith('#') && !l.startsWith('javascript')).slice(0, 20),
             },
         });
 
