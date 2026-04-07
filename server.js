@@ -742,13 +742,18 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                         }
                     }
 
-                    // מיון: הכי חדש קודם (לפי תאריך חתימה)
+                    // מיון: "לא מולא" קודם (דורש פעולה), אח"כ לפי תאריך חתימה יורד
                     if (questionnaires.length > 0) {
                         questionnaires.sort((a, b) => {
+                            // עדיפות ראשונה: "לא מולא" לפני "מולא"
+                            const aUnfilled = (a.status === 'לא מולא') ? 0 : 1;
+                            const bUnfilled = (b.status === 'לא מולא') ? 0 : 1;
+                            if (aUnfilled !== bUnfilled) return aUnfilled - bUnfilled;
+                            // עדיפות שנייה: תאריך חתימה יורד
                             return (b.signed_date || '').localeCompare(a.signed_date || '');
                         });
 
-                        // הפוליסה האחרונה/רלוונטית ביותר
+                        // השאלון הרלוונטי ביותר — "לא מולא" אם קיים, אחרת האחרון שמולא
                         const latest = questionnaires[0];
                         employeeData.medical_form_id = latest.form_id || '';
                         employeeData.medical_form_status = latest.status || '';
