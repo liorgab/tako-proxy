@@ -691,6 +691,82 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 }
                 // ══════════════════════════════════════════════════════════
 
+                // ══════════════════════════════════════════════════════════
+                // ── חילוץ נתוני שאלונים רפואיים ─────────────────────────
+                // ══════════════════════════════════════════════════════════
+                const medicalStart = empPageHtml.indexOf('שאלונים רפואיים');
+                if (medicalStart > -1) {
+                    // מחפשים את הטבלה הבאה אחרי הכותרת
+                    const medicalSection = empPageHtml.substring(medicalStart, medicalStart + 5000);
+                    const medicalRows = medicalSection.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+                    const questionnaires = [];
+
+                    for (const row of medicalRows) {
+                        const q = {};
+
+                        // סטטוס: מולא / לא מולא
+                        if (row.includes('מולא')) {
+                            q.status = row.includes('לא מולא') ? 'לא מולא' : 'מולא';
+                        }
+
+                        // Form ID — מתוך לינקים /medical_forms/{id}/preview או /medical_forms/{id}/edit
+                        const formIdMatch = row.match(/\/medical_forms\/(\d+)\/(preview|edit)/);
+                        if (formIdMatch) {
+                            q.form_id = formIdMatch[1];
+                            q.form_type = formIdMatch[2]; // preview = ממולא, edit = לא ממולא
+                        }
+
+                        // גם מ-checkbox: <input type="checkbox" id="133811" value="133811">
+                        if (!q.form_id) {
+                            const checkboxMatch = row.match(/medical_forms\[\].*?value=["'](\d+)["']/);
+                            if (checkboxMatch) q.form_id = checkboxMatch[1];
+                        }
+
+                        // גם מ-send_medical_form_link parameter
+                        if (!q.form_id) {
+                            const sendLinkMatch = row.match(/send_medical_form_link=(\d+)/);
+                            if (sendLinkMatch) q.form_id = sendLinkMatch[1];
+                        }
+
+                        // תאריך חתימה
+                        const dateMatch = row.match(/(\d{4}-\d{2}-\d{2})\s+\d{2}:\d{2}:\d{2}/);
+                        if (dateMatch) q.signed_date = dateMatch[1];
+
+                        // מספר פוליסה
+                        const polNumMatch = row.match(/<td>\s*(\d{4,})\s*<\/td>/);
+                        if (polNumMatch) q.policy_number = polNumMatch[1];
+
+                        // רק שורות עם מידע רלוונטי
+                        if (q.status || q.form_id) {
+                            questionnaires.push(q);
+                        }
+                    }
+
+                    // מיון: הכי חדש קודם (לפי תאריך חתימה)
+                    if (questionnaires.length > 0) {
+                        questionnaires.sort((a, b) => {
+                            return (b.signed_date || '').localeCompare(a.signed_date || '');
+                        });
+
+                        // הפוליסה האחרונה/רלוונטית ביותר
+                        const latest = questionnaires[0];
+                        employeeData.medical_form_id = latest.form_id || '';
+                        employeeData.medical_form_status = latest.status || '';
+                        employeeData.medical_form_signed_date = latest.signed_date || '';
+                        if (latest.form_id) {
+                            if (latest.status === 'מולא') {
+                                employeeData.medical_form_url = `${BASE}/medical_forms/${latest.form_id}/preview`;
+                            } else {
+                                employeeData.medical_form_url = `${BASE}/medical_forms/${latest.form_id}/edit`;
+                            }
+                        }
+                    }
+
+                    // שמירת כל השאלונים למטרות debug
+                    employeeData.all_questionnaires = questionnaires;
+                }
+                // ══════════════════════════════════════════════════════════
+
             } catch (e) {
                 // Don't fail if employee page can't be read
             }
