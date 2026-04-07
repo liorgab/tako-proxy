@@ -1014,11 +1014,12 @@ app.post('/tako/get-card', auth, async (req, res) => {
     }
 });
 // ── /tako/cancel-policy — ביטול פוליסה בטאקו ────────────────────────────
-// שולח בקשת ביטול דרך HTTP (ללא Playwright)
+// שולח בקשת ביטול דרך HTTP — PATCH ל-/employments/{eid}
+// מקבל tako_employee_id (מספר עובד בטאקו) ומחפש את ה-employment ID מדף העובד
 app.post('/tako/cancel-policy', auth, async (req, res) => {
-    const { email, password, policy_eid, cancel_date } = req.body || {};
+    const { email, password, tako_employee_id, cancel_date } = req.body || {};
     if (!email || !password) return res.status(400).json({ success: false, error: 'email + password required' });
-    if (!policy_eid) return res.status(400).json({ success: false, error: 'policy_eid required' });
+    if (!tako_employee_id) return res.status(400).json({ success: false, error: 'tako_employee_id required' });
 
     const BASE = 'https://tako-ins.com';
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
@@ -1084,8 +1085,40 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
             }
         }
 
-        // ── שלב 2: גישה לדף הפוליסה ───────────────────────────────────
-        const empUrl = `${BASE}/front/employer/employment?eid=${policy_eid}`;
+        // ── שלב 2: דף העובד — חילוץ employment ID ──────────────────────
+        const employeeUrl = `${BASE}/front/employer/employee?id=${tako_employee_id}`;
+        const employeeRes = await fetch(employeeUrl, {
+            method: 'GET', redirect: 'follow',
+            headers: {
+                'Cookie': cookieString(sessionCookieArr),
+                'User-Agent': UA, 'Accept': 'text/html,*/*',
+            },
+        });
+        const employeeHtml = await employeeRes.text();
+        const employeeCookies = parseCookies(employeeRes.headers.get('set-cookie'));
+        if (employeeCookies.length > 0) {
+            const updatedArr = mergeCookies(sessionCookieArr, employeeCookies);
+            sessionCookieArr.length = 0;
+            updatedArr.forEach(c => sessionCookieArr.push(c));
+        }
+
+        // חיפוש לינק employment עם eid
+        const eidMatch = employeeHtml.match(/\/front\/employer\/employment\?eid=(\d+)/);
+        if (!eidMatch) {
+            return res.json({
+                success: false,
+                error: 'Could not find employment ID on employee page',
+                debug: {
+                    employee_url: employeeUrl,
+                    page_length: employeeHtml.length,
+                    page_title: (employeeHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
+                },
+            });
+        }
+        const employmentId = eidMatch[1];
+
+        // ── שלב 3: דף הפוליסה — חילוץ CSRF וטופס ביטול ─────────────────
+        const empUrl = `${BASE}/front/employer/employment?eid=${employmentId}`;
         const empRes = await fetch(empUrl, {
             method: 'GET', redirect: 'follow',
             headers: {
@@ -1101,240 +1134,80 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
             updatedArr.forEach(c => sessionCookieArr.push(c));
         }
 
-        // חילוץ CSRF token מהדף
+        // חילוץ CSRF token
         let pageCsrf = '';
         for (const re of [
             /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
             /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
         ]) {
             const m = empHtml.match(re);
             if (m) { pageCsrf = m[1]; break; }
         }
 
-        // ── שלב 3: חיפוש טופס/לינק ביטול ──────────────────────────────
-        // דפוסים אפשריים לטופס ביטול:
-        // 1. טופס עם action שמכיל "cancel" או "ביטול"
-        // 2. לינק ביטול
-        // 3. טופס PATCH/DELETE לעדכון סטטוס
+        // חילוץ authenticity_token מהטופס
+        const formTokenMatch = empHtml.match(/edit_employment[\s\S]*?name="authenticity_token"\s+value="([^"]+)"/i);
+        const formToken = formTokenMatch ? formTokenMatch[1] : pageCsrf;
 
-        // חיפוש כל הטפסים בדף
-        const formMatches = empHtml.match(/<form[\s\S]*?<\/form>/gi) || [];
-        let cancelFormAction = '';
-        let cancelFormMethod = 'POST';
-        let cancelFormFields = {};
-
-        for (const form of formMatches) {
-            // חיפוש טפסים עם "cancel", "ביטול", "terminate", "stop"
-            if (form.match(/cancel|ביטול|terminate|stop_policy|deactivate/i)) {
-                const actionMatch = form.match(/action=["']([^"']+)["']/i);
-                const methodMatch = form.match(/method=["']([^"']+)["']/i);
-                if (actionMatch) cancelFormAction = actionMatch[1];
-                if (methodMatch) cancelFormMethod = methodMatch[1].toUpperCase();
-
-                // חילוץ hidden fields
-                const hiddenFields = form.matchAll(/<input[^>]+type=["']hidden["'][^>]*>/gi);
-                for (const field of hiddenFields) {
-                    const nameMatch = field[0].match(/name=["']([^"']+)["']/i);
-                    const valueMatch = field[0].match(/value=["']([^"']*?)["']/i);
-                    if (nameMatch) {
-                        cancelFormFields[nameMatch[1]] = valueMatch ? valueMatch[1] : '';
-                    }
-                }
-                break;
-            }
-        }
-
-        // חיפוש לינק ביטול אם לא מצאנו טופס
-        if (!cancelFormAction) {
-            const cancelLinkPatterns = [
-                /href=["']([^"']*cancel[^"']*)["']/i,
-                /href=["']([^"']*ביטול[^"']*)["']/i,
-                /href=["']([^"']*terminate[^"']*)["']/i,
-                /href=["']([^"']*stop[^"']*)["']/i,
-                /href=["']([^"']*deactivate[^"']*)["']/i,
-            ];
-
-            for (const pattern of cancelLinkPatterns) {
-                const m = empHtml.match(pattern);
-                if (m) {
-                    cancelFormAction = m[1];
-                    cancelFormMethod = 'GET';
-                    break;
-                }
-            }
-        }
-
-        // ── שלב 4: ביצוע הביטול ────────────────────────────────────────
-        if (cancelFormAction) {
-            const cancelUrl = cancelFormAction.startsWith('http')
-                ? cancelFormAction
-                : `${BASE}${cancelFormAction}`;
-
-            // הוספת תאריך ביטול ו-CSRF
-            const cancelBody = new URLSearchParams();
-            if (pageCsrf) cancelBody.append('authenticity_token', pageCsrf);
-
-            // הוספת hidden fields מהטופס
-            for (const [key, val] of Object.entries(cancelFormFields)) {
-                cancelBody.append(key, val);
-            }
-
-            // הוספת תאריך ביטול — ננסה כמה שמות שדות אפשריים
-            if (cancel_date) {
-                cancelBody.append('cancel_date', cancel_date);
-                cancelBody.append('cancellation_date', cancel_date);
-                cancelBody.append('employment[cancel_date]', cancel_date);
-                cancelBody.append('employment[cancellation_date]', cancel_date);
-                cancelBody.append('employment[end_date]', cancel_date);
-            }
-
-            if (cancelFormMethod === 'GET') {
-                // ננווט ללינק הביטול
-                const cancelRes = await fetch(cancelUrl, {
-                    method: 'GET', redirect: 'follow',
-                    headers: {
-                        'Cookie': cookieString(sessionCookieArr),
-                        'User-Agent': UA, 'Accept': 'text/html,*/*',
-                        'Referer': empUrl,
-                    },
-                });
-                const cancelHtml = await cancelRes.text();
-
-                // בדיקה אם נגיע לדף אישור
-                // ייתכן שצריך לשלוח POST נוסף מדף הביטול
-                const confirmFormMatch = cancelHtml.match(/<form[\s\S]*?<\/form>/gi) || [];
-                let confirmAction = '';
-                let confirmFields = {};
-
-                for (const form of confirmFormMatch) {
-                    if (form.match(/cancel|ביטול|confirm|אישור|submit/i)) {
-                        const actionMatch = form.match(/action=["']([^"']+)["']/i);
-                        if (actionMatch) confirmAction = actionMatch[1];
-
-                        const hiddenFields = form.matchAll(/<input[^>]+type=["']hidden["'][^>]*>/gi);
-                        for (const field of hiddenFields) {
-                            const nameMatch = field[0].match(/name=["']([^"']+)["']/i);
-                            const valueMatch = field[0].match(/value=["']([^"']*?)["']/i);
-                            if (nameMatch) confirmFields[nameMatch[1]] = valueMatch ? valueMatch[1] : '';
-                        }
-                        break;
-                    }
-                }
-
-                if (confirmAction) {
-                    const confirmUrl = confirmAction.startsWith('http') ? confirmAction : `${BASE}${confirmAction}`;
-                    const confirmBody = new URLSearchParams();
-                    let confirmCsrf = '';
-                    for (const re of [/name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i, /name="authenticity_token"\s+value="([^"]+)"/i]) {
-                        const m = cancelHtml.match(re);
-                        if (m) { confirmCsrf = m[1]; break; }
-                    }
-                    if (confirmCsrf) confirmBody.append('authenticity_token', confirmCsrf);
-                    for (const [key, val] of Object.entries(confirmFields)) {
-                        confirmBody.append(key, val);
-                    }
-                    if (cancel_date) {
-                        confirmBody.append('cancel_date', cancel_date);
-                        confirmBody.append('cancellation_date', cancel_date);
-                        confirmBody.append('employment[cancel_date]', cancel_date);
-                    }
-
-                    const confirmRes = await fetch(confirmUrl, {
-                        method: 'POST', redirect: 'follow',
-                        headers: {
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'Cookie': cookieString(sessionCookieArr),
-                            'User-Agent': UA, 'Referer': cancelUrl, 'Origin': BASE,
-                        },
-                        body: confirmBody.toString(),
-                    });
-                    const confirmHtml = await confirmRes.text();
-
-                    return res.json({
-                        success: true,
-                        message: 'Cancel request submitted via confirm form',
-                        debug: {
-                            cancel_url: cancelUrl,
-                            confirm_url: confirmUrl,
-                            confirm_status: confirmRes.status,
-                            response_preview: confirmHtml.slice(0, 500),
-                        },
-                    });
-                }
-
-                return res.json({
-                    success: true,
-                    message: 'Cancel page loaded',
-                    debug: {
-                        cancel_url: cancelUrl,
-                        page_length: cancelHtml.length,
-                        has_confirm_form: confirmFormMatch.length > 0,
-                        response_preview: cancelHtml.slice(0, 500),
-                    },
-                });
-            }
-
-            // POST/PATCH ביטול ישיר
-            const cancelRes = await fetch(cancelUrl, {
-                method: cancelFormMethod === 'PATCH' ? 'PATCH' : 'POST',
-                redirect: 'follow',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'Cookie': cookieString(sessionCookieArr),
-                    'User-Agent': UA,
-                    'Referer': empUrl,
-                    'Origin': BASE,
-                },
-                body: cancelBody.toString(),
-            });
-            const cancelResultHtml = await cancelRes.text();
-            const cancelLocation = cancelRes.headers.get('location') || '';
-
-            // בדיקת הצלחה
-            const isSuccess = cancelRes.status === 302
-                || cancelRes.status === 200
-                || cancelResultHtml.includes('בקשת ביטול')
-                || cancelResultHtml.includes('ביטול בוצע')
-                || cancelResultHtml.includes('success');
-
+        if (!formToken) {
             return res.json({
-                success: isSuccess,
-                message: isSuccess ? 'Cancel request submitted' : 'Cancel submitted but status unclear',
-                debug: {
-                    cancel_url: cancelUrl,
-                    method: cancelFormMethod,
-                    status: cancelRes.status,
-                    location: cancelLocation,
-                    response_preview: cancelResultHtml.slice(0, 500),
-                },
+                success: false,
+                error: 'Could not find CSRF token on employment page',
+                debug: { employment_url: empUrl, employment_id: employmentId },
             });
         }
 
-        // ── לא מצאנו טופס ביטול — מחזירים debug ──────────────────────
-        const allForms = formMatches.map(f => {
-            const action = (f.match(/action=["']([^"']+)["']/i) || [])[1] || '';
-            const method = (f.match(/method=["']([^"']+)["']/i) || [])[1] || 'GET';
-            return { action, method, preview: f.slice(0, 200) };
-        });
-
-        const allLinks = [];
-        const linkRegex = /href=["']([^"']+)["']/gi;
-        let lm;
-        while ((lm = linkRegex.exec(empHtml)) !== null) {
-            allLinks.push(lm[1]);
+        // ── שלב 4: שליחת PATCH לביטול ──────────────────────────────────
+        // הטופס בטאקו: PATCH /employments/{eid}
+        // שדות: _method=patch, authenticity_token, employment[id], employment[req_cancel_date], commit
+        const cancelUrl = `${BASE}/employments/${employmentId}`;
+        const cancelBody = new URLSearchParams();
+        cancelBody.append('_method', 'patch');
+        cancelBody.append('authenticity_token', formToken);
+        cancelBody.append('employment[id]', employmentId);
+        // תאריך ביטול — הטופס משתמש ב-type="date" כלומר YYYY-MM-DD
+        if (cancel_date) {
+            cancelBody.append('employment[req_cancel_date]', cancel_date);
         }
+        cancelBody.append('commit', 'ביטול הפוליסה');
+
+        const cancelRes = await fetch(cancelUrl, {
+            method: 'POST',  // Rails PATCH = POST + _method=patch
+            redirect: 'follow',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Cookie': cookieString(sessionCookieArr),
+                'User-Agent': UA,
+                'Referer': empUrl,
+                'Origin': BASE,
+                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+            },
+            body: cancelBody.toString(),
+        });
+        const cancelResultHtml = await cancelRes.text();
+
+        // בדיקת הצלחה
+        const hasCancel = cancelResultHtml.includes('בקשת ביטול')
+            || cancelResultHtml.includes('ביטול בוצע')
+            || cancelResultHtml.includes('cancel');
+        const isRedirect = cancelRes.status === 302 || cancelRes.status === 301;
+        const isSuccess = hasCancel || isRedirect || cancelRes.status === 200;
+
+        // חילוץ סטטוס מהתגובה
+        const statusMatch = cancelResultHtml.match(/<span[^>]*class="[^"]*label[^"]*"[^>]*>([^<]+)<\/span>/i);
+        const resultStatus = statusMatch ? statusMatch[1].trim() : '';
 
         return res.json({
-            success: false,
-            error: 'Cancel form/link not found on employment page',
+            success: isSuccess,
+            message: isSuccess ? 'Cancel request submitted successfully' : 'Cancel submitted but status unclear',
+            employment_id: employmentId,
+            result_status: resultStatus,
             debug: {
-                employment_url: empUrl,
-                page_length: empHtml.length,
-                page_title: (empHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || '',
-                forms_found: allForms,
-                all_links: allLinks.filter(l => !l.startsWith('#') && !l.startsWith('javascript')).slice(0, 30),
-                csrf_found: !!pageCsrf,
+                cancel_url: cancelUrl,
+                cancel_date: cancel_date,
+                status: cancelRes.status,
+                final_url: cancelRes.url,
+                has_cancel_text: hasCancel,
+                response_preview: cancelResultHtml.slice(0, 500),
             },
         });
 
