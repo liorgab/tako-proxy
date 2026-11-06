@@ -553,7 +553,32 @@ app.post('/tako/search-employee', auth, async (req, res) => {
     const BASE = TAKO_BASE;
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     try {
-        // ── שלב 1+2: session מה-cache + חיפוש עובד בדף wizard ─────────
+        // ── שלב 0: בדיקת קיום דרך דף החיפוש (read-only) ─────────────────
+        // חשוב: new_employee_wizard_2 עם דרכון שלא קיים **יוצר עובד ריק בטאקו**,
+        // לכן ניגשים ל-wizard רק אחרי שהחיפוש אישר שהעובד קיים.
+        const searchRes = await takoFetch(email, password, `${BASE}/front/employer/search?q=${encodeURIComponent(passport)}`, {
+            method: 'GET', headers: { 'Accept': 'text/html,*/*' },
+        });
+        const searchHtml = await searchRes.text();
+        const wantedPassport = String(passport).trim().toUpperCase();
+        let searchEmployeeId = '';
+        for (const row of (searchHtml.match(/<tr[\s\S]*?<\/tr>/gi) || [])) {
+            const cells = (row.match(/<td[^>]*>[\s\S]*?<\/td>/gi) || [])
+                .map(td => td.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim().toUpperCase());
+            if (!cells.includes(wantedPassport)) continue;
+            const m = row.match(/employee\?id=(\d+)/);
+            if (m) { searchEmployeeId = m[1]; break; }
+        }
+        if (!searchEmployeeId) {
+            return res.json({
+                success: false, not_found: true, passport,
+                tako_employee_id: '', tako_employee_url: '',
+                employee_data: { is_existing: false },
+                error: 'Employee not found in Tako',
+            });
+        }
+
+        // ── שלב 1+2: חיפוש עובד בדף wizard (העובד קיים — לא נוצר חדש) ──
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
         const wizardRes = await takoFetch(email, password, wizardUrl, {
             method: 'GET',
@@ -594,6 +619,8 @@ app.post('/tako/search-employee', auth, async (req, res) => {
             const showMatch = wizardHtml.match(/showEmployeeDetails\((\d+)\)/);
             if (showMatch) takoEmployeeId = showMatch[1];
         }
+        // Fallback: the ID from the read-only search page
+        if (!takoEmployeeId) takoEmployeeId = searchEmployeeId;
         const isExistingEmployee = wizardHtml.includes('edit_employee');
         const firstNameMatch = wizardHtml.match(/employee\[first_name\].*?value=["']([^"']+)["']/i);
         const lastNameMatch = wizardHtml.match(/employee\[last_name\].*?value=["']([^"']+)["']/i);
