@@ -1,5 +1,5 @@
 /**
- * Tako Insurance Proxy Server v2 — with full debug
+ * Tako Insurance Proxy Server v2.1 — session cache + 429 circuit breaker
  */
 const express = require('express');
 const fetch   = require('node-fetch');
@@ -41,8 +41,214 @@ function mergeCookies(...cookieArrays) {
 function cookieString(cookieArray) {
     return cookieArray.join('; ');
 }
+
+// ══════════════════════════════════════════════════════════════════════════
+// ── Tako session cache + login throttle (fix 429) ─────────────────────────
+// ══════════════════════════════════════════════════════════════════════════
+// Login once, reuse the Rails session cookies for SESSION_TTL_MS, re-login
+// only when Tako redirects to /users/sign_in. One login at a time per user
+// (mutex). On 429 from Tako, stop all logins until retry_after has passed.
+const TAKO_BASE = process.env.TAKO_BASE || 'https://tako-ins.com';
+const TAKO_HOST = new URL(TAKO_BASE).host;
+const TAKO_UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+const SESSION_TTL_MS     = 25 * 60 * 1000;
+const LOGIN_FAIL_BACKOFF = 60 * 1000;      // after wrong credentials — don't hammer sign_in
+const sessions     = new Map();            // email -> { cookies: string[], password, ts }
+const loginLocks   = new Map();            // email -> Promise<string[]>
+const loginFailed  = new Map();            // email -> until (ms)
+let   blockedUntil = 0;                    // circuit breaker after 429
+const stats = { logins: 0, login_failures: 0, rate_limited: 0, session_reuses: 0, last_login_at: null };
+
+class TakoRateLimited extends Error {
+    constructor(retryAfterSec) { super('TAKO_RATE_LIMITED'); this.retryAfter = retryAfterSec; }
+}
+class TakoLoginFailed extends Error {
+    constructor(info = {}) { super('Login failed'); this.info = info; }
+}
+
+function setCookiesOf(r) {
+    const raw = r.headers.raw ? r.headers.raw()['set-cookie'] : null;
+    if (raw && raw.length) return raw.map(c => c.split(';')[0].trim()).filter(c => c.includes('='));
+    return parseCookies(r.headers.get('set-cookie'));
+}
+function retryAfterOf(r) {
+    const h = r.headers.get('retry-after');
+    const n = parseInt(h || '', 10);
+    if (n > 0) return n;
+    const d = h ? Date.parse(h) : NaN;
+    if (!isNaN(d)) return Math.max(1, Math.ceil((d - Date.now()) / 1000));
+    return 120;
+}
+function check429(r) {
+    if (r.status === 429) {
+        const ra = retryAfterOf(r);
+        blockedUntil = Math.max(blockedUntil, Date.now() + ra * 1000);
+        stats.rate_limited++;
+        console.warn(`[tako] 429 from Tako — blocking logins for ${ra}s`);
+        throw new TakoRateLimited(ra);
+    }
+}
+function assertNotBlocked() {
+    if (Date.now() < blockedUntil)
+        throw new TakoRateLimited(Math.ceil((blockedUntil - Date.now()) / 1000));
+}
+function extractCsrf(html) {
+    for (const re of [
+        /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
+        /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
+        /name="authenticity_token"\s+value="([^"]+)"/i,
+        /value="([^"]+)"\s+name="authenticity_token"/i,
+    ]) {
+        const m = html.match(re);
+        if (m) return m[1];
+    }
+    return '';
+}
+const isSignIn = loc => /\/users\/sign_in/.test(loc || '');
+
+async function doLogin(email, password) {
+    assertNotBlocked();
+    const failUntil = loginFailed.get(email);
+    if (failUntil && Date.now() < failUntil) throw new TakoLoginFailed({ reason: 'recent_login_failure' });
+
+    const LOGIN_URL = `${TAKO_BASE}/users/sign_in`;
+    const g = await fetch(LOGIN_URL, {
+        method: 'GET', redirect: 'manual',
+        headers: { 'User-Agent': TAKO_UA, 'Accept': 'text/html,*/*', 'Accept-Language': 'he-IL,he;q=0.9' },
+    });
+    check429(g);
+    const html = await g.text();
+    let cookies = setCookiesOf(g);
+    const csrf = extractCsrf(html);
+
+    const body = new URLSearchParams();
+    if (csrf) body.append('authenticity_token', csrf);
+    body.append('user[email]', email);
+    body.append('user[password]', password);
+    body.append('user[remember_me]', '1');
+    body.append('commit', 'כניסה');
+    const p = await fetch(LOGIN_URL, {
+        method: 'POST', redirect: 'manual', body: body.toString(),
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': cookieString(cookies),
+            'User-Agent': TAKO_UA, 'Referer': LOGIN_URL, 'Origin': TAKO_BASE,
+            'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+        },
+    });
+    check429(p);
+    await p.text();
+    const loc = p.headers.get('location') || '';
+    if (!(p.status === 302 || p.status === 303) || isSignIn(loc)) {
+        stats.login_failures++;
+        loginFailed.set(email, Date.now() + LOGIN_FAIL_BACKOFF);
+        console.warn(`[tako] login FAILED for ${email} (status ${p.status}, location ${loc})`);
+        throw new TakoLoginFailed({ status: p.status, location: loc, csrf_found: !!csrf });
+    }
+    loginFailed.delete(email);
+    cookies = mergeCookies(cookies, setCookiesOf(p));
+    stats.logins++;
+    stats.last_login_at = new Date().toISOString();
+    console.log(`[tako] LOGIN #${stats.logins} for ${email} → ${loc}`);
+    sessions.set(email, { cookies, password, ts: Date.now(), location: loc });
+    return cookies;
+}
+
+// Returns valid session cookies (array) — from cache when possible
+async function getTakoSession(email, password, { force = false } = {}) {
+    const s = sessions.get(email);
+    if (!force && s && s.password === password && Date.now() - s.ts < SESSION_TTL_MS) {
+        stats.session_reuses++;
+        return s.cookies;
+    }
+    if (loginLocks.has(email)) return loginLocks.get(email);
+    const pr = doLogin(email, password).finally(() => loginLocks.delete(email));
+    loginLocks.set(email, pr);
+    return pr;
+}
+
+// Authenticated fetch to Tako. Follows redirects manually (so cookies rolled
+// by Rails on every hop are kept). If Tako bounces to sign_in, the cached
+// session is dropped and — for GET only — we log in again once and retry.
+// Non-Tako hosts (CDN images etc.) are fetched plainly, without cookies.
+// Returned response has extra .finalUrl (like node-fetch's res.url).
+async function takoFetch(email, password, url, opts = {}) {
+    const target = new URL(url, TAKO_BASE);
+    if (target.host !== TAKO_HOST) {
+        const r = await fetch(target.toString(), opts);
+        r.finalUrl = r.url;
+        return r;
+    }
+    assertNotBlocked();
+    const method = (opts.method || 'GET').toUpperCase();
+    const follow = opts.redirect !== 'manual';
+    for (let attempt = 0; attempt < 2; attempt++) {
+        let cookies = await getTakoSession(email, password, { force: attempt === 1 });
+        let cur = target.toString();
+        let curMethod = method;
+        let curBody = opts.body;
+        let expired = false;
+        let r;
+        for (let hop = 0; hop < 6; hop++) {
+            r = await fetch(cur, {
+                method: curMethod, body: curBody, redirect: 'manual',
+                headers: {
+                    'User-Agent': TAKO_UA, 'Accept-Language': 'he-IL,he;q=0.9',
+                    ...(opts.headers || {}), 'Cookie': cookieString(cookies),
+                },
+            });
+            check429(r);
+            const newCookies = setCookiesOf(r);
+            if (newCookies.length) {
+                cookies = mergeCookies(cookies, newCookies);
+                const s = sessions.get(email);
+                if (s) s.cookies = mergeCookies(s.cookies, newCookies);   // Rails rolls the session cookie
+            }
+            const loc = r.headers.get('location') || '';
+            if (r.status === 401 || (r.status >= 300 && r.status < 400 && isSignIn(loc))) { expired = true; break; }
+            if (r.status >= 300 && r.status < 400 && loc && follow) {
+                await r.text();
+                const next = new URL(loc, cur);
+                if (next.host !== TAKO_HOST) { cur = next.toString(); break; }
+                cur = next.toString();
+                if (r.status !== 307 && r.status !== 308) { curMethod = 'GET'; curBody = undefined; }
+                continue;
+            }
+            break;
+        }
+        if (expired) {
+            await r.text().catch(() => {});
+            sessions.delete(email);
+            console.log(`[tako] session expired (${method} ${target.pathname})`);
+            if (method !== 'GET') throw new Error('TAKO_SESSION_EXPIRED');   // never auto-resubmit a write
+            continue;
+        }
+        r.finalUrl = cur;
+        return r;
+    }
+    throw new Error('TAKO_SESSION_EXPIRED');
+}
+
+// Uniform error handler: 429 → HTTP 429 {rate_limited}, bad login → legacy shape
+function sendTakoError(res, e, extra = {}) {
+    if (e instanceof TakoRateLimited)
+        return res.status(429).json({
+            success: false, rate_limited: true, retry_after: e.retryAfter, ...extra,
+            error: `טאקו חסם זמנית בשל ריבוי בקשות. נסה שוב בעוד ${e.retryAfter} שניות`,
+        });
+    if (e instanceof TakoLoginFailed)
+        return res.json({ success: false, ...extra, error: 'Login failed', ...e.info });
+    return res.status(500).json({ success: false, ...extra, error: e.message, stack: e.stack });
+}
+
 app.get('/health', (_, res) =>
-    res.json({ ok: true, ts: new Date().toISOString() })
+    res.json({
+        ok: true, ts: new Date().toISOString(), version: '2.1-session-cache',
+        tako: {
+            ...stats,
+            cached_sessions: sessions.size,
+            blocked_for_sec: Math.max(0, Math.ceil((blockedUntil - Date.now()) / 1000)),
+        },
+    })
 );
 // ── /tako/debug — בדיקת גישה בסיסית לטאקו ─────────────────────────────────
 app.get('/tako/debug', auth, async (req, res) => {
@@ -109,95 +315,26 @@ app.post('/tako/login', auth, async (req, res) => {
     const { email, password } = req.body || {};
     if (!email || !password)
         return res.status(400).json({ error: 'email + password required' });
-    const BASE      = 'https://tako-ins.com';
-    const LOGIN_URL = `${BASE}/users/sign_in`;
-    const UA        = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     try {
-        // ── Step 1: GET ──────────────────────────────────────────────────────
-        const g = await fetch(LOGIN_URL, {
-            method: 'GET',
-            redirect: 'follow',
-            headers: {
-                'User-Agent':      UA,
-                'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language':  'he-IL,he;q=0.9,en-US;q=0.8',
-                'Accept-Encoding':  'gzip, deflate, br',
-                'Connection':       'keep-alive',
-                'Cache-Control':    'no-cache',
-                'Pragma':           'no-cache',
-            },
-        });
-        const html = await g.text();
-        // cookies
-        const setCookie = g.headers.get('set-cookie') || '';
-        const gCookies = setCookie
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map(c => c.split(';')[0].trim())
-            .filter(c => c.includes('='));
-        const cookieStr = gCookies.join('; ');
-        // CSRF
-        let csrf = '';
-        for (const re of [
-            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
-            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
-            /value="([^"]+)"\s+name="authenticity_token"/i,
-            /"authenticity_token","([^"]+)"/i,
-            /authenticity_token.*?value[=:]["'\s]+([A-Za-z0-9+/=_\-]{20,})/i,
-        ]) {
-            const m = html.match(re);
-            if (m) { csrf = m[1]; break; }
-        }
-        // ── Step 2: POST ─────────────────────────────────────────────────────
-        const body = new URLSearchParams();
-        if (csrf) body.append('authenticity_token', csrf);
-        body.append('user[email]',       email);
-        body.append('user[password]',    password);
-        body.append('user[remember_me]', '0');
-        body.append('commit',            'כניסה');
-        const p = await fetch(LOGIN_URL, {
-            method: 'POST',
-            redirect: 'manual',
-            headers: {
-                'Content-Type':    'application/x-www-form-urlencoded',
-                'Cookie':          cookieStr,
-                'User-Agent':      UA,
-                'Referer':         LOGIN_URL,
-                'Origin':          BASE,
-                'Accept':          'text/html,application/xhtml+xml,*/*;q=0.8',
-                'Accept-Language':  'he-IL,he;q=0.9',
-                'Connection':       'keep-alive',
-            },
-            body: body.toString(),
-        });
-        const pCookies = (p.headers.get('set-cookie') || '')
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map(c => c.split(';')[0].trim())
-            .filter(c => c.includes('='));
-        const allCookies = [...new Set([...gCookies, ...pCookies])].join('; ');
-        const location   = p.headers.get('location') || '';
-        const pBody      = await p.text();
-        const success = p.status === 302
-            || location.includes('employer')
-            || location.includes('home');
+        // שימוש ב-session מה-cache (התחברות אמיתית רק אם אין session תקף)
+        const before = stats.logins;
+        const cookies = await getTakoSession(email, password, { force: !!req.body.force });
+        const s = sessions.get(email) || {};
         return res.json({
-            success,
-            status:          p.status,
-            location,
-            session_cookies: allCookies,
+            success:         true,
+            status:          302,
+            location:        s.location || '',
+            session_cookies: cookieString(cookies),
+            cached:          stats.logins === before,
             debug: {
-                get_status:     g.status,
-                get_final_url:  g.url,
-                html_length:    html.length,
-                html_preview:   html.slice(0, 300),
-                csrf_found:     !!csrf,
-                csrf_preview:   csrf ? csrf.slice(0, 25) + '...' : null,
-                cookies_count:  gCookies.length,
-                post_body_preview: pBody.slice(0, 300),
+                cookies_count:    cookies.length,
+                session_age_sec:  s.ts ? Math.round((Date.now() - s.ts) / 1000) : null,
             },
         });
     } catch (e) {
-        return res.status(500).json({ error: e.message, stack: e.stack });
+        if (e instanceof TakoLoginFailed)
+            return res.json({ success: false, status: e.info.status, location: e.info.location || '', session_cookies: '', error: 'Login failed', debug: e.info });
+        return sendTakoError(res, e);
     }
 });
 // ── /tako/create-employee — רישום עובד חדש + פתיחת פוליסה בטאקו ──────────
@@ -217,7 +354,7 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         return res.status(400).json({ error: 'first_name, last_name, passport required' });
     if (!from_date || !to_date || !insurance_company)
         return res.status(400).json({ error: 'from_date, to_date, insurance_company required' });
-    const BASE = 'https://tako-ins.com';
+    const BASE = TAKO_BASE;
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     const dateFormat = req.body.date_format || 'iso';
     function toTakoDate(isoDate) {
@@ -229,85 +366,23 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         return isoDate;
     }
     try {
-        // ── שלב 1: התחברות לטאקו ────────────────────────────────────────────
-        const LOGIN_URL = `${BASE}/users/sign_in`;
-        const g = await fetch(LOGIN_URL, {
-            method: 'GET', redirect: 'follow',
-            headers: {
-                'User-Agent': UA,
-                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-                'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-            },
-        });
-        const loginHtml = await g.text();
-        const gCookies = parseCookies(g.headers.get('set-cookie'));
-        let loginCsrf = '';
-        for (const re of [
-            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
-            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
-            /authenticity_token.*?value[=:]["'\s]+([A-Za-z0-9+/=_\-]{20,})/i,
-        ]) {
-            const m = loginHtml.match(re);
-            if (m) { loginCsrf = m[1]; break; }
-        }
-        const loginBody = new URLSearchParams();
-        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
-        loginBody.append('user[email]', email);
-        loginBody.append('user[password]', password);
-        loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
-        const loginRes = await fetch(LOGIN_URL, {
-            method: 'POST', redirect: 'manual',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': cookieString(gCookies),
-                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
-                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-            },
-            body: loginBody.toString(),
-        });
-        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
-        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
-        const loginLocation = loginRes.headers.get('location') || '';
-        const loginSuccess = loginRes.status === 302
-            || loginLocation.includes('employer')
-            || loginLocation.includes('home');
-        if (!loginSuccess) {
-            return res.json({
-                success: false, step: 'login', error: 'Login failed',
-                status: loginRes.status, location: loginLocation,
-            });
-        }
-        // ── שלב 2: גישה לטופס רישום עובד ──────────────────────────────────
+        // ── שלב 1+2: session מה-cache + גישה לטופס רישום עובד ─────────────
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
-        if (loginLocation) {
-            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
-            const followRes = await fetch(redirectUrl, {
-                method: 'GET', redirect: 'follow',
-                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8' },
+        let wizardRes;
+        try {
+            wizardRes = await takoFetch(email, password, wizardUrl, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+                    'Referer': `${BASE}/front/employer/new_employee_wizard_1`,
+                },
             });
-            await followRes.text();
-            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
-            if (followCookies.length > 0) {
-                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
-                sessionCookieArr.length = 0;
-                updatedArr.forEach(c => sessionCookieArr.push(c));
-            }
+        } catch (e) {
+            if (e instanceof TakoLoginFailed)
+                return res.json({ success: false, step: 'login', error: 'Login failed', status: e.info.status, location: e.info.location || '' });
+            throw e;
         }
-        const wizardRes = await fetch(wizardUrl, {
-            method: 'GET', redirect: 'follow',
-            headers: {
-                'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA,
-                'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-                'Referer': `${BASE}/front/employer/new_employee_wizard_1`,
-            },
-        });
         const wizardHtml = await wizardRes.text();
-        const wizardCookiesNew = parseCookies(wizardRes.headers.get('set-cookie'));
-        const afterWizardCookies = mergeCookies(sessionCookieArr, wizardCookiesNew);
         let formCsrf = '';
         for (const re of [
             /name="authenticity_token"\s+value="([^"]+)"/i,
@@ -321,10 +396,9 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         if (!formCsrf) {
             return res.json({
                 success: false, step: 'wizard', error: 'Could not find CSRF token in wizard form',
-                wizard_status: wizardRes.status, wizard_url: wizardRes.url, html_preview: wizardHtml.slice(0, 500),
+                wizard_status: wizardRes.status, wizard_url: wizardRes.finalUrl, html_preview: wizardHtml.slice(0, 500),
             });
         }
-        const finalCookies = cookieString(afterWizardCookies);
         // ── שלב 3: שליחת טופס רישום העובד ─────────────────────────────────
         const formData = new URLSearchParams();
         formData.append('authenticity_token', formCsrf);
@@ -351,11 +425,10 @@ app.post('/tako/create-employee', auth, async (req, res) => {
         formData.append('employee[tmp_to_date]', toTakoDate(to_date));
         formData.append('employee[tmp_insurance_company]', insurance_company || '');
         formData.append('commit', 'שמור');
-        const submitRes = await fetch(`${BASE}/front/employer/save_new_employee`, {
+        const submitRes = await takoFetch(email, password, `${BASE}/front/employer/save_new_employee`, {
             method: 'POST', redirect: 'manual',
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': finalCookies, 'User-Agent': UA,
                 'Referer': wizardUrl, 'Origin': BASE,
                 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
             },
@@ -372,12 +445,12 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             if (submitLocation) {
                 try {
                     const redirectUrl = submitLocation.startsWith('http') ? submitLocation : `${BASE}${submitLocation}`;
-                    const followRes = await fetch(redirectUrl, {
-                        method: 'GET', redirect: 'follow',
-                        headers: { 'Cookie': finalCookies, 'User-Agent': UA, 'Accept': 'text/html,*/*' },
+                    const followRes = await takoFetch(email, password, redirectUrl, {
+                        method: 'GET',
+                        headers: { 'Accept': 'text/html,*/*' },
                     });
                     const followBody = await followRes.text();
-                    const finalUrl = followRes.url || '';
+                    const finalUrl = followRes.finalUrl || '';
                     const urlIdMatch = finalUrl.match(/[?&]id=(\d+)/);
                     if (urlIdMatch) takoEmployeeId = urlIdMatch[1];
                     if (!takoEmployeeId) {
@@ -438,15 +511,17 @@ app.post('/tako/create-employee', auth, async (req, res) => {
             },
         });
     } catch (e) {
-        return res.status(500).json({ success: false, step: 'exception', error: e.message, stack: e.stack });
+        return sendTakoError(res, e, { step: 'exception' });
     }
 });
 // ── /tako/proxy ─────────────────────────────────────────────────────────────
 app.post('/tako/proxy', auth, async (req, res) => {
-    const { url, method = 'GET', body, session_cookies, headers: xh = {} } = req.body || {};
+    const { url, method = 'GET', body, email, password, headers: xh = {} } = req.body || {};
+    let { session_cookies } = req.body || {};
     if (!url) return res.status(400).json({ error: 'url required' });
-    if (!session_cookies) return res.status(400).json({ error: 'session_cookies required' });
+    if (!session_cookies && !(email && password)) return res.status(400).json({ error: 'session_cookies required' });
     try {
+        if (!session_cookies) session_cookies = cookieString(await getTakoSession(email, password));
         const opts = {
             method, redirect: 'manual',
             headers: {
@@ -462,9 +537,11 @@ app.post('/tako/proxy', auth, async (req, res) => {
             opts.body = typeof body === 'string' ? body : new URLSearchParams(body).toString();
         }
         const r    = await fetch(url, opts);
+        check429(r);
         const text = await r.text();
         return res.json({ status: r.status, location: r.headers.get('location') || '', body: text.slice(0, 8000) });
     } catch (e) {
+        if (e instanceof TakoRateLimited || e instanceof TakoLoginFailed) return sendTakoError(res, e);
         return res.status(500).json({ error: e.message });
     }
 });
@@ -473,69 +550,40 @@ app.post('/tako/search-employee', auth, async (req, res) => {
     const { email, password, passport } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email + password required' });
     if (!passport) return res.status(400).json({ error: 'passport required' });
-    const BASE = 'https://tako-ins.com';
+    const BASE = TAKO_BASE;
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
     try {
-        // ── שלב 1: התחברות ─────────────────────────────────────────────
-        const LOGIN_URL = `${BASE}/users/sign_in`;
-        const g = await fetch(LOGIN_URL, {
-            method: 'GET', redirect: 'follow',
-            headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' },
+        // ── שלב 0: בדיקת קיום דרך דף החיפוש (read-only) ─────────────────
+        // חשוב: new_employee_wizard_2 עם דרכון שלא קיים **יוצר עובד ריק בטאקו**,
+        // לכן ניגשים ל-wizard רק אחרי שהחיפוש אישר שהעובד קיים.
+        const searchRes = await takoFetch(email, password, `${BASE}/front/employer/search?q=${encodeURIComponent(passport)}`, {
+            method: 'GET', headers: { 'Accept': 'text/html,*/*' },
         });
-        const loginHtml = await g.text();
-        const gCookies = parseCookies(g.headers.get('set-cookie'));
-        let loginCsrf = '';
-        for (const re of [
-            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
-            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
-        ]) {
-            const m = loginHtml.match(re);
-            if (m) { loginCsrf = m[1]; break; }
+        const searchHtml = await searchRes.text();
+        const wantedPassport = String(passport).trim().toUpperCase();
+        let searchEmployeeId = '';
+        for (const row of (searchHtml.match(/<tr[\s\S]*?<\/tr>/gi) || [])) {
+            const cells = (row.match(/<td[^>]*>[\s\S]*?<\/td>/gi) || [])
+                .map(td => td.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim().toUpperCase());
+            if (!cells.includes(wantedPassport)) continue;
+            const m = row.match(/employee\?id=(\d+)/);
+            if (m) { searchEmployeeId = m[1]; break; }
         }
-        const loginBody = new URLSearchParams();
-        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
-        loginBody.append('user[email]', email);
-        loginBody.append('user[password]', password);
-        loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
-        const loginRes = await fetch(LOGIN_URL, {
-            method: 'POST', redirect: 'manual',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': cookieString(gCookies),
-                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
-            },
-            body: loginBody.toString(),
-        });
-        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
-        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
-        const loginLocation = loginRes.headers.get('location') || '';
-        if (!(loginRes.status === 302 || loginLocation.includes('employer') || loginLocation.includes('home'))) {
-            return res.json({ success: false, error: 'Login failed' });
-        }
-        // Follow login redirect
-        if (loginLocation) {
-            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
-            const followRes = await fetch(redirectUrl, {
-                method: 'GET', redirect: 'follow',
-                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA },
+        if (!searchEmployeeId) {
+            return res.json({
+                success: false, not_found: true, passport,
+                tako_employee_id: '', tako_employee_url: '',
+                employee_data: { is_existing: false },
+                error: 'Employee not found in Tako',
             });
-            await followRes.text();
-            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
-            if (followCookies.length > 0) {
-                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
-                sessionCookieArr.length = 0;
-                updatedArr.forEach(c => sessionCookieArr.push(c));
-            }
         }
-        // ── שלב 2: חיפוש עובד בדף wizard ──────────────────────────────
+
+        // ── שלב 1+2: חיפוש עובד בדף wizard (העובד קיים — לא נוצר חדש) ──
         const wizardUrl = `${BASE}/front/employer/new_employee_wizard_2?passport=${encodeURIComponent(passport)}&commit=%D7%97%D7%99%D7%A4%D7%95%D7%A9`;
-        const wizardRes = await fetch(wizardUrl, {
-            method: 'GET', redirect: 'follow',
+        const wizardRes = await takoFetch(email, password, wizardUrl, {
+            method: 'GET',
             headers: {
-                'Cookie': cookieString(sessionCookieArr),
-                'User-Agent': UA, 'Accept': 'text/html,*/*',
+                'Accept': 'text/html,*/*',
                 'Referer': `${BASE}/front/employer/new_employee_wizard_1`,
             },
         });
@@ -571,6 +619,8 @@ app.post('/tako/search-employee', auth, async (req, res) => {
             const showMatch = wizardHtml.match(/showEmployeeDetails\((\d+)\)/);
             if (showMatch) takoEmployeeId = showMatch[1];
         }
+        // Fallback: the ID from the read-only search page
+        if (!takoEmployeeId) takoEmployeeId = searchEmployeeId;
         const isExistingEmployee = wizardHtml.includes('edit_employee');
         const firstNameMatch = wizardHtml.match(/employee\[first_name\].*?value=["']([^"']+)["']/i);
         const lastNameMatch = wizardHtml.match(/employee\[last_name\].*?value=["']([^"']+)["']/i);
@@ -583,12 +633,9 @@ app.post('/tako/search-employee', auth, async (req, res) => {
             takoEmployeeUrl = `${BASE}/front/employer/employee?id=${takoEmployeeId}`;
             // ── שלב 3: גישה לדף העובד לחילוץ פרטים נוספים ──────────
             try {
-                const empPageRes = await fetch(takoEmployeeUrl, {
-                    method: 'GET', redirect: 'follow',
-                    headers: {
-                        'Cookie': cookieString(sessionCookieArr),
-                        'User-Agent': UA, 'Accept': 'text/html,*/*',
-                    },
+                const empPageRes = await takoFetch(email, password, takoEmployeeUrl, {
+                    method: 'GET',
+                    headers: { 'Accept': 'text/html,*/*' },
                 });
                 const empPageHtml = await empPageRes.text();
 
@@ -778,7 +825,9 @@ app.post('/tako/search-employee', auth, async (req, res) => {
                 // ══════════════════════════════════════════════════════════
 
             } catch (e) {
-                // Don't fail if employee page can't be read
+                // Don't fail if employee page can't be parsed — but never hide
+                // auth/rate-limit errors (partial data would wipe fields in Base44)
+                if (e instanceof TakoRateLimited || e instanceof TakoLoginFailed || /^TAKO_/.test(e.message)) throw e;
             }
         }
         return res.json({
@@ -787,10 +836,10 @@ app.post('/tako/search-employee', auth, async (req, res) => {
             tako_employee_id: takoEmployeeId,
             tako_employee_url: takoEmployeeUrl,
             employee_data: employeeData,
-            wizard_url: wizardRes.url,
+            wizard_url: wizardRes.finalUrl,
         });
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message, stack: e.stack });
+        return sendTakoError(res, e);
     }
 });
 // ── /tako/get-card — הורדת כרטיס קופת חולים מטאקו ───────────────────────
@@ -802,69 +851,11 @@ app.post('/tako/get-card', auth, async (req, res) => {
     if (!email || !password) return res.status(400).json({ success: false, error: 'email + password required' });
     if (!tako_employee_id) return res.status(400).json({ success: false, error: 'tako_employee_id required' });
 
-    const BASE = 'https://tako-ins.com';
+    const BASE = TAKO_BASE;
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 
     try {
-        // ── שלב 1: התחברות ─────────────────────────────────────────────
-        const LOGIN_URL = `${BASE}/users/sign_in`;
-        const g = await fetch(LOGIN_URL, {
-            method: 'GET', redirect: 'follow',
-            headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' },
-        });
-        const loginHtml = await g.text();
-        const gCookies = parseCookies(g.headers.get('set-cookie'));
-
-        let loginCsrf = '';
-        for (const re of [
-            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
-            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
-        ]) {
-            const m = loginHtml.match(re);
-            if (m) { loginCsrf = m[1]; break; }
-        }
-
-        const loginBody = new URLSearchParams();
-        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
-        loginBody.append('user[email]', email);
-        loginBody.append('user[password]', password);
-        loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
-
-        const loginRes = await fetch(LOGIN_URL, {
-            method: 'POST', redirect: 'manual',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': cookieString(gCookies),
-                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
-            },
-            body: loginBody.toString(),
-        });
-
-        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
-        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
-        const loginLocation = loginRes.headers.get('location') || '';
-
-        if (!(loginRes.status === 302 || loginLocation.includes('employer') || loginLocation.includes('home'))) {
-            return res.json({ success: false, error: 'Login failed' });
-        }
-
-        // Follow login redirect
-        if (loginLocation) {
-            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
-            const followRes = await fetch(redirectUrl, {
-                method: 'GET', redirect: 'follow',
-                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA },
-            });
-            await followRes.text();
-            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
-            if (followCookies.length > 0) {
-                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
-                sessionCookieArr.length = 0;
-                updatedArr.forEach(c => sessionCookieArr.push(c));
-            }
-        }
+        // ── שלב 1: session מה-cache (נוצר אוטומטית ב-takoFetch) ─────────
 
         // ── שלב 2: ניסיון ישיר — /employees/{id}/card_{hmo} ────────────
         // ננסה את כל קופות החולים ונחזיר HTML מלא עם תמונות inline
@@ -873,13 +864,9 @@ app.post('/tako/get-card', auth, async (req, res) => {
         for (const hmo of HMO_SLUGS) {
             const cardUrl = `${BASE}/employees/${tako_employee_id}/card_${hmo}`;
             try {
-                const cardRes = await fetch(cardUrl, {
-                    method: 'GET', redirect: 'follow',
-                    headers: {
-                        'Cookie': cookieString(sessionCookieArr),
-                        'User-Agent': UA,
-                        'Accept': 'text/html,image/*,*/*',
-                    },
+                const cardRes = await takoFetch(email, password, cardUrl, {
+                    method: 'GET',
+                    headers: { 'Accept': 'text/html,image/*,*/*' },
                 });
                 const ct = cardRes.headers.get('content-type') || '';
 
@@ -934,13 +921,9 @@ app.post('/tako/get-card', auth, async (req, res) => {
                 // הורדה והמרה של כל התמונות
                 for (const rep of imgReplacements) {
                     try {
-                        const r = await fetch(rep.imgUrl, {
-                            method: 'GET', redirect: 'follow',
-                            headers: {
-                                'Cookie': cookieString(sessionCookieArr),
-                                'User-Agent': UA,
-                                'Accept': 'image/*,*/*',
-                            },
+                        const r = await takoFetch(email, password, rep.imgUrl, {
+                            method: 'GET',
+                            headers: { 'Accept': 'image/*,*/*' },
                         });
                         const imgCt = r.headers.get('content-type') || 'image/png';
                         const buf = Buffer.from(await r.arrayBuffer());
@@ -951,13 +934,9 @@ app.post('/tako/get-card', auth, async (req, res) => {
 
                 for (const rep of bgReplacements) {
                     try {
-                        const r = await fetch(rep.bgUrl, {
-                            method: 'GET', redirect: 'follow',
-                            headers: {
-                                'Cookie': cookieString(sessionCookieArr),
-                                'User-Agent': UA,
-                                'Accept': 'image/*,*/*',
-                            },
+                        const r = await takoFetch(email, password, rep.bgUrl, {
+                            method: 'GET',
+                            headers: { 'Accept': 'image/*,*/*' },
                         });
                         const bgCt = r.headers.get('content-type') || 'image/png';
                         const buf = Buffer.from(await r.arrayBuffer());
@@ -975,13 +954,7 @@ app.post('/tako/get-card', auth, async (req, res) => {
                         : cssHref.startsWith('//') ? `https:${cssHref}`
                         : `${BASE}${cssHref}`;
                     try {
-                        const r = await fetch(cssUrl, {
-                            method: 'GET', redirect: 'follow',
-                            headers: {
-                                'Cookie': cookieString(sessionCookieArr),
-                                'User-Agent': UA,
-                            },
-                        });
+                        const r = await takoFetch(email, password, cssUrl, { method: 'GET' });
                         const cssText = await r.text();
                         html = html.replace(cssMatch[0], `<style>${cssText}</style>`);
                     } catch (e) { /* skip failed CSS */ }
@@ -996,7 +969,8 @@ app.post('/tako/get-card', auth, async (req, res) => {
                 });
 
             } catch (e) {
-                // ממשיכים לקופת חולים הבאה
+                // ממשיכים לקופת חולים הבאה — אבל לא מסתירים חסימה/התחברות כושלת
+                if (e instanceof TakoRateLimited || e instanceof TakoLoginFailed || /^TAKO_/.test(e.message)) throw e;
             }
         }
 
@@ -1010,7 +984,7 @@ app.post('/tako/get-card', auth, async (req, res) => {
         });
 
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message, stack: e.stack });
+        return sendTakoError(res, e);
     }
 });
 // ── /tako/cancel-policy — ביטול פוליסה בטאקו ────────────────────────────
@@ -1021,86 +995,19 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
     if (!email || !password) return res.status(400).json({ success: false, error: 'email + password required' });
     if (!tako_employee_id) return res.status(400).json({ success: false, error: 'tako_employee_id required' });
 
-    const BASE = 'https://tako-ins.com';
+    const BASE = TAKO_BASE;
     const UA   = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 
     try {
-        // ── שלב 1: התחברות ─────────────────────────────────────────────
-        const LOGIN_URL = `${BASE}/users/sign_in`;
-        const g = await fetch(LOGIN_URL, {
-            method: 'GET', redirect: 'follow',
-            headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*' },
-        });
-        const loginHtml = await g.text();
-        const gCookies = parseCookies(g.headers.get('set-cookie'));
-
-        let loginCsrf = '';
-        for (const re of [
-            /name=["']csrf-token["'][^>]+content=["']([^"']+)["']/i,
-            /content=["']([^"']+)["'][^>]*name=["']csrf-token["']/i,
-            /name="authenticity_token"\s+value="([^"]+)"/i,
-        ]) {
-            const m = loginHtml.match(re);
-            if (m) { loginCsrf = m[1]; break; }
-        }
-
-        const loginBody = new URLSearchParams();
-        if (loginCsrf) loginBody.append('authenticity_token', loginCsrf);
-        loginBody.append('user[email]', email);
-        loginBody.append('user[password]', password);
-        loginBody.append('user[remember_me]', '0');
-        loginBody.append('commit', 'כניסה');
-
-        const loginRes = await fetch(LOGIN_URL, {
-            method: 'POST', redirect: 'manual',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': cookieString(gCookies),
-                'User-Agent': UA, 'Referer': LOGIN_URL, 'Origin': BASE,
-            },
-            body: loginBody.toString(),
-        });
-
-        const loginPostCookies = parseCookies(loginRes.headers.get('set-cookie'));
-        const sessionCookieArr = mergeCookies(gCookies, loginPostCookies);
-        const loginLocation = loginRes.headers.get('location') || '';
-
-        if (!(loginRes.status === 302 || loginLocation.includes('employer') || loginLocation.includes('home'))) {
-            return res.json({ success: false, error: 'Login failed' });
-        }
-
-        // Follow login redirect
-        if (loginLocation) {
-            const redirectUrl = loginLocation.startsWith('http') ? loginLocation : `${BASE}${loginLocation}`;
-            const followRes = await fetch(redirectUrl, {
-                method: 'GET', redirect: 'follow',
-                headers: { 'Cookie': cookieString(sessionCookieArr), 'User-Agent': UA },
-            });
-            await followRes.text();
-            const followCookies = parseCookies(followRes.headers.get('set-cookie'));
-            if (followCookies.length > 0) {
-                const updatedArr = mergeCookies(sessionCookieArr, followCookies);
-                sessionCookieArr.length = 0;
-                updatedArr.forEach(c => sessionCookieArr.push(c));
-            }
-        }
+        // ── שלב 1: session מה-cache (נוצר אוטומטית ב-takoFetch) ─────────
 
         // ── שלב 2: דף העובד — חילוץ employment ID ──────────────────────
         const employeeUrl = `${BASE}/front/employer/employee?id=${tako_employee_id}`;
-        const employeeRes = await fetch(employeeUrl, {
-            method: 'GET', redirect: 'follow',
-            headers: {
-                'Cookie': cookieString(sessionCookieArr),
-                'User-Agent': UA, 'Accept': 'text/html,*/*',
-            },
+        const employeeRes = await takoFetch(email, password, employeeUrl, {
+            method: 'GET',
+            headers: { 'Accept': 'text/html,*/*' },
         });
         const employeeHtml = await employeeRes.text();
-        const employeeCookies = parseCookies(employeeRes.headers.get('set-cookie'));
-        if (employeeCookies.length > 0) {
-            const updatedArr = mergeCookies(sessionCookieArr, employeeCookies);
-            sessionCookieArr.length = 0;
-            updatedArr.forEach(c => sessionCookieArr.push(c));
-        }
 
         // חיפוש לינק employment עם eid
         const eidMatch = employeeHtml.match(/\/front\/employer\/employment\?eid=(\d+)/);
@@ -1119,20 +1026,11 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
 
         // ── שלב 3: דף הפוליסה — חילוץ CSRF וטופס ביטול ─────────────────
         const empUrl = `${BASE}/front/employer/employment?eid=${employmentId}`;
-        const empRes = await fetch(empUrl, {
-            method: 'GET', redirect: 'follow',
-            headers: {
-                'Cookie': cookieString(sessionCookieArr),
-                'User-Agent': UA, 'Accept': 'text/html,*/*',
-            },
+        const empRes = await takoFetch(email, password, empUrl, {
+            method: 'GET',
+            headers: { 'Accept': 'text/html,*/*' },
         });
         const empHtml = await empRes.text();
-        const empCookies = parseCookies(empRes.headers.get('set-cookie'));
-        if (empCookies.length > 0) {
-            const updatedArr = mergeCookies(sessionCookieArr, empCookies);
-            sessionCookieArr.length = 0;
-            updatedArr.forEach(c => sessionCookieArr.push(c));
-        }
 
         // חילוץ CSRF token
         let pageCsrf = '';
@@ -1170,13 +1068,10 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
         }
         cancelBody.append('commit', 'ביטול הפוליסה');
 
-        const cancelRes = await fetch(cancelUrl, {
-            method: 'POST',  // Rails PATCH = POST + _method=patch
-            redirect: 'follow',
+        const cancelRes = await takoFetch(email, password, cancelUrl, {
+            method: 'POST',  // Rails PATCH = POST + _method=patch (redirect followed as GET)
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Cookie': cookieString(sessionCookieArr),
-                'User-Agent': UA,
                 'Referer': empUrl,
                 'Origin': BASE,
                 'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
@@ -1205,14 +1100,14 @@ app.post('/tako/cancel-policy', auth, async (req, res) => {
                 cancel_url: cancelUrl,
                 cancel_date: cancel_date,
                 status: cancelRes.status,
-                final_url: cancelRes.url,
+                final_url: cancelRes.finalUrl,
                 has_cancel_text: hasCancel,
                 response_preview: cancelResultHtml.slice(0, 500),
             },
         });
 
     } catch (e) {
-        return res.status(500).json({ success: false, error: e.message, stack: e.stack });
+        return sendTakoError(res, e);
     }
 });
-app.listen(PORT, () => console.log(`✅ Tako Proxy v2 on :${PORT}`));
+app.listen(PORT, () => console.log(`✅ Tako Proxy v2.1 (session cache) on :${PORT}`));
